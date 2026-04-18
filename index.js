@@ -55,7 +55,7 @@ const CONFIG = {
     maxUsernameLength: 50,
     maxAttachmentSize: 50 * 1024 * 1024, // 50 MB
     maxAttachments: 10,
-    allowedAttachmentTypes: ['image', 'video', 'file'],
+    allowedAttachmentTypes: ['image', 'video', 'file', 'voice'],
     maxReactionLength: 8,
     maxPayloadSize: '5mb',
   },
@@ -164,6 +164,7 @@ function normalizeMessage(msg) {
     isEdited: Boolean(msg.isEdited),
     isDeleted: Boolean(msg.isDeleted),
     clientMessageId: msg.clientMessageId || null,
+    metadata: msg.metadata || {},
     createdAt: msg.createdAt || new Date().toISOString(),
     updatedAt: msg.updatedAt || msg.createdAt || new Date().toISOString(),
   };
@@ -451,8 +452,9 @@ async function startServer() {
 
   await Promise.all([
     db.collection('messages').createIndex({ chatId: 1, createdAt: -1 }),
+    db.collection('messages').createIndex({ senderId: 1, status: 1 }),
     db.collection('messages').createIndex({ clientMessageId: 1 }, { unique: true, sparse: true }),
-    db.collection('chats').createIndex({ participants: 1 }),
+    db.collection('chats').createIndex({ participants: 1, updatedAt: -1 }),
     db.collection('users').createIndex({ username: 1 }, { unique: true }),
     db.collection('users').createIndex({ usernameLower: 1 }, { unique: true, sparse: true }),
     db.collection('users').createIndex({ displayName: 1 }),
@@ -592,38 +594,29 @@ async function startServer() {
     successResponse(res, { user: req.user });
   });
 
-  // POST /api/auth/guest
-  app.post('/api/auth/guest', async (req, res) => {
+
+
+  // POST /api/auth/profile
+  app.post('/api/auth/profile', auth, async (req, res) => {
     try {
-      let inserted = null;
-      for (let attempt = 0; attempt < 5; attempt++) {
-        const candidate = 'guest_' + crypto.randomBytes(4).toString('hex');
-        try {
-          const doc = {
-            username: candidate,
-            usernameLower: candidate,
-            displayName: 'Guest ' + candidate.slice(6, 10).toUpperCase(),
-            passwordHash: null,
-            avatar: null,
-            isGuest: true,
-            isAdmin: false,
-            isOnline: false,
-            createdAt: new Date(),
-            lastSeenAt: new Date(),
-          };
-          const result = await db.collection('users').insertOne(doc);
-          inserted = { ...doc, _id: result.insertedId };
-          break;
-        } catch (err) {
-          if (err?.code !== 11000) throw err;
-        }
-      }
-      if (!inserted) return errorResponse(res, 500, 'Could not create guest account', 'GUEST_CREATE_FAILED');
-      const token = await createSession(db, inserted._id);
-      successResponse(res, { token, user: normalizeUser(inserted) }, 201);
+      const { displayName, avatar, about } = req.body;
+      const patch = {};
+      if (typeof displayName === 'string') patch.displayName = sanitizeText(displayName, 50);
+      if (typeof avatar === 'string') patch.avatar = avatar; // Base64 or URL
+      if (typeof about === 'string') patch.about = sanitizeText(about, 200);
+
+      if (Object.keys(patch).length === 0) return errorResponse(res, 400, 'Nothing to update', 'EMPTY_PATCH');
+
+      await db.collection('users').updateOne({ _id: toObjectId(req.userId) }, { $set: patch });
+      const updated = await getCachedUser(db, req.userId);
+      
+      // Notify other users about name/avatar change if needed
+      // (Simplified: relies on next fetch or presence)
+
+      successResponse(res, { user: updated });
     } catch (err) {
-      console.error('[POST /api/auth/guest] Error:', err.message);
-      errorResponse(res, 500, 'Failed to create guest session', 'GUEST_ERROR');
+      console.error('[POST /api/auth/profile] Error:', err.message);
+      errorResponse(res, 500, 'Failed to update profile', 'PROFILE_UPDATE_ERROR');
     }
   });
 
@@ -742,8 +735,9 @@ async function startServer() {
     try {
       const chats = await db
         .collection('chats')
-        .find({ participants: req.userId }, { projection: { type: 1, name: 1, participants: 1, lastMessage: 1, createdAt: 1, updatedAt: 1 } })
+        .find({ participants: req.userId }, { projection: { type: 1, name: 1, participants: 1, lastMessage: 1, updatedAt: 1 } })
         .sort({ updatedAt: -1 })
+        .limit(100)
         .toArray();
 
       const allParticipantIds = [...new Set(chats.flatMap((c) => c.participants || []))];
@@ -751,7 +745,11 @@ async function startServer() {
 
       const normalized = chats.map((chat) => {
         const c = normalizeChat(chat);
-        c.participants = (chat.participants || []).map((pid) => usersMap.get(String(pid)) || { id: String(pid) });
+        // Only keep summary info for sidebar
+        c.participants = (chat.participants || []).map((pid) => {
+            const u = usersMap.get(String(pid));
+            return u ? { id: u.id, username: u.username, displayName: u.displayName, avatar: u.avatar } : { id: String(pid) };
+        });
         return c;
       });
 
@@ -928,6 +926,15 @@ async function startServer() {
       normalized.sender = sender;
 
       safeEmit(io, `chat:${chatId}`, 'message:new', buildSocketEvent('message:new', { message: normalized }, { chatId, userId: req.userId }));
+
+      // Also notify individual participants (ensures they see it even if they haven't joined the chat room yet)
+      const participants = chat.participants || [];
+      participants.forEach(pid => {
+        if (String(pid) !== req.userId) {
+          safeEmit(io, `user:${pid}`, 'message:new', buildSocketEvent('message:new', { message: normalized }, { chatId }));
+        }
+      });
+
       successResponse(res, { message: normalized }, 201);
     } catch (err) {
       if (err.code === 11000 && err.keyPattern?.clientMessageId) {
