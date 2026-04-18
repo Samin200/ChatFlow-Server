@@ -790,7 +790,14 @@ async function startServer() {
       };
       const result = await db.collection('chats').insertOne(chatDoc);
       chatDoc._id = result.insertedId;
-      successResponse(res, { chat: normalizeChat(chatDoc) }, 201);
+
+      const normalized = normalizeChat(chatDoc);
+      // Notify all participants about the new chat so they can join the room
+      allParticipants.forEach((pid) => {
+        safeEmit(io, `user:${pid}`, 'chat:created', buildSocketEvent('chat:created', { chat: normalized }, { chatId: String(result.insertedId) }));
+      });
+
+      successResponse(res, { chat: normalized }, 201);
     } catch (err) {
       console.error('[POST /api/chats] Error:', err.message);
       errorResponse(res, 500, 'Failed to create chat', 'CREATE_CHAT_ERROR');
