@@ -827,7 +827,8 @@ async function startServer() {
 
       const sortDir = direction === 'after' ? 1 : -1;
       const messages = await db.collection('messages').find(query).sort({ createdAt: sortDir }).limit(limit + 1).toArray();
-      if (messages.length > limit) messages.pop();
+      const hasMore = messages.length > limit;
+      if (hasMore) messages.pop();
       if (direction !== 'after') messages.reverse();
 
       // Mark fetched messages as DELIVERED if recipient is current user
