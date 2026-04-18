@@ -1,1436 +1,1272 @@
-// ============================================================
-//  ChatFlow Backend - index.js
-//  Single-file Node.js backend (Express + Socket.io + MongoDB)
-// ============================================================
+// ============================================================================
+// ChatFlow Backend — Production-Ready Single-File Architecture
+// Express + Socket.IO + MongoDB (Native Driver)
+// Version: 2.0.1
+// ============================================================================
 
-"use strict";
+'use strict';
 
-require("dotenv").config();
+require('dotenv').config();
 
-// --- ENV GUARD ------------------------------------------------
-if (!process.env.JWT_SECRET) {
-  console.error("[FATAL] Missing JWT_SECRET in environment. Set it in .env or as an env variable.");
-  process.exit(1);
-}
+// ============================================================================
+// SECTION 0: ENV GUARD
+// ============================================================================
 
 if (!process.env.MONGO_URL) {
-  console.error("MONGO_URL missing");
+  console.error('[FATAL] Missing MONGO_URL in environment. Set it in .env');
   process.exit(1);
 }
 
-const express = require("express");
-const http = require("http");
-const { Server } = require("socket.io");
-const { MongoClient, ObjectId } = require("mongodb");
-const bcrypt = require("bcrypt");
-const jwt = require("jsonwebtoken");
-const cors = require("cors");
-const crypto = require("crypto");
+const express = require('express');
+const { createServer } = require('http');
+const { Server } = require('socket.io');
+const { MongoClient, ObjectId } = require('mongodb');
+const crypto = require('crypto');
+const bcrypt = require('bcrypt');
 
-// --- CONFIG ---------------------------------------------------
-const PORT = process.env.PORT || 5020;
-const MONGO_URL = process.env.MONGO_URL;
-const JWT_SECRET = process.env.JWT_SECRET;
-const CLIENT_URL = process.env.CLIENT_URL || "http://localhost:5173";
-const DB_NAME = "chatflow";
 const SALT_ROUNDS = 10;
-const TOKEN_TTL = "7d";
 
-// --- APP SETUP ------------------------------------------------
-const app = express();
-const server = http.createServer(app);
-const io = new Server(server, {
+// ============================================================================
+// SECTION 1: CONFIGURATION
+// ============================================================================
+
+const CONFIG = {
+  port: process.env.PORT || 3001,
+  mongoUri: process.env.MONGO_URL,
+  dbName: process.env.DB_NAME || 'chatflow',
   cors: {
-    origin: CLIENT_URL,
-    methods: ["GET", "POST", "PUT", "DELETE", "PATCH"],
+    origin: process.env.CLIENT_URL || 'http://localhost:5173',
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH'],
+    credentials: true,
   },
-});
+  pagination: {
+    defaultLimit: 50,
+    maxLimit: 100,
+  },
+  typing: {
+    throttleMs: 2000,
+    expireMs: 3000,
+  },
+  onlineStatus: {
+    debounceMs: 5000,
+  },
+  validation: {
+    maxMessageLength: 5000,
+    maxUsernameLength: 50,
+    maxAttachmentSize: 50 * 1024 * 1024, // 50 MB
+    maxAttachments: 10,
+    allowedAttachmentTypes: ['image', 'video', 'file'],
+    maxReactionLength: 8,
+    maxPayloadSize: '5mb',
+  },
+  cache: {
+    userTtlMs: 5 * 60 * 1000,
+  },
+};
 
-app.use(express.json({ limit: "10mb" }));
-app.use(express.urlencoded({ extended: true }));
+// ============================================================================
+// SECTION 2: HELPERS — Validation & Sanitization
+// ============================================================================
 
-app.use(
-  cors({
-    origin: CLIENT_URL,
-    methods: ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization"],
-  })
-);
+function isValidObjectId(str) {
+  if (!str || typeof str !== 'string') return false;
+  return /^[a-fA-F0-9]{24}$/.test(str);
+}
 
-// GET /sync/bootstrap - frontend startup (no auth)
-app.get("/sync/bootstrap", (req, res) => {
-  return res.json({ success: true, serverTime: Date.now() });
-});
-
-// --- MONGODB CONNECTION ---------------------------------------
-let client;
-let db;
-
-async function connectDB() {
+function toObjectId(str) {
+  if (!isValidObjectId(str)) return null;
   try {
-    client = new MongoClient(MONGO_URL);
-    await client.connect();
-    db = client.db("chatflow");
-    console.log("MongoDB Connected");
-
-    // -- Indexes --
-    await db.collection("users").createIndex({ usernameLower: 1 }, { unique: true });
-    await db.collection("chats").createIndex({ canonicalKey: 1 }, { sparse: true });
-    await db.collection("messages").createIndex({ chatId: 1, createdAt: -1 });
-    await db.collection("friends").createIndex({ userA: 1, userB: 1 }, { unique: true });
-
-    console.log("[MongoDB] Indexes ensured.");
-  } catch (err) {
-    console.error("MongoDB Error:", err);
-    process.exit(1);
-  }
-}
-
-// --- HELPERS --------------------------------------------------
-
-function newId() {
-  return new ObjectId();
-}
-
-function toStr(id) {
-  return id ? id.toString() : null;
-}
-
-function toObjectId(value) {
-  if (!value) return null;
-  const raw = String(value).trim();
-  if (!ObjectId.isValid(raw)) return null;
-  try {
-    return new ObjectId(raw);
+    return new ObjectId(str);
   } catch {
     return null;
   }
 }
 
-function escapeRegex(value) {
-  return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+function sanitizeText(text, maxLength = CONFIG.validation.maxMessageLength) {
+  if (typeof text !== 'string') return '';
+  return text
+    .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '')
+    .trim()
+    .slice(0, maxLength);
 }
 
-function sortedPairKey(a, b) {
-  return [a, b].sort().join(":");
+function isNonEmptyString(val) {
+  return typeof val === 'string' && val.trim().length > 0;
 }
 
-function ok(res, data = {}, status = 200) {
+function isValidReaction(reaction) {
+  if (typeof reaction !== 'string') return false;
+  const trimmed = reaction.trim();
+  return trimmed.length > 0 && Buffer.byteLength(trimmed, 'utf8') <= CONFIG.validation.maxReactionLength;
+}
+
+function validateAttachment(att) {
+  if (!att || typeof att !== 'object') return null;
+  const { url, type, size, name } = att;
+  if (!isNonEmptyString(url)) return null;
+  if (!CONFIG.validation.allowedAttachmentTypes.includes(type)) return null;
+  if (typeof size !== 'number' || size <= 0 || size > CONFIG.validation.maxAttachmentSize) return null;
+  if (!isNonEmptyString(name)) return null;
+  return {
+    url: sanitizeText(url, 2048),
+    type,
+    size,
+    name: sanitizeText(name, 255),
+  };
+}
+
+function validateAttachments(attachments) {
+  if (!Array.isArray(attachments)) return [];
+  return attachments
+    .slice(0, CONFIG.validation.maxAttachments)
+    .map(validateAttachment)
+    .filter(Boolean);
+}
+
+function ensureChatIdString(chatId) {
+  if (!chatId) return null;
+  if (isValidObjectId(String(chatId))) return String(chatId);
+  if (chatId instanceof ObjectId) return String(chatId);
+  return null;
+}
+
+function isValidWhatsapp(value) {
+  if (typeof value !== 'string') return false;
+  const cleaned = value.replace(/[^\d]/g, '');
+  return cleaned.length >= 7 && cleaned.length <= 20;
+}
+
+function isValidUsername(value) {
+  if (typeof value !== 'string') return false;
+  const trimmed = value.trim();
+  if (trimmed.length < 3 || trimmed.length > CONFIG.validation.maxUsernameLength) return false;
+  return /^[a-zA-Z0-9_.\-]+$/.test(trimmed);
+}
+
+// ============================================================================
+// SECTION 3: NORMALIZATION LAYER
+// ============================================================================
+
+function normalizeMessage(msg) {
+  if (!msg) return null;
+  const normalized = {
+    id: String(msg._id || msg.id),
+    chatId: ensureChatIdString(msg.chatId) || '',
+    senderId: String(msg.senderId || ''),
+    content: msg.content || '',
+    text: msg.content || '', // Alias for frontend compatibility
+    type: msg.type || 'text',
+    attachments: Array.isArray(msg.attachments) ? msg.attachments : [],
+    reactions: msg.reactions || {},
+    mentions: Array.isArray(msg.mentions) ? msg.mentions : [],
+    replyTo: msg.replyTo ? String(msg.replyTo) : null,
+    status: msg.status || 'sent',
+    isEdited: Boolean(msg.isEdited),
+    isDeleted: Boolean(msg.isDeleted),
+    clientMessageId: msg.clientMessageId || null,
+    createdAt: msg.createdAt || new Date().toISOString(),
+    updatedAt: msg.updatedAt || msg.createdAt || new Date().toISOString(),
+  };
+  if (msg.sender) normalized.sender = normalizeUser(msg.sender);
+  return normalized;
+}
+
+function normalizeUser(user) {
+  if (!user) return null;
+  return {
+    id: String(user._id || user.id),
+    username: user.username || '',
+    displayName: user.displayName || user.username || '',
+    avatar: user.avatar || null,
+    isOnline: Boolean(user.isOnline),
+    lastSeenAt: user.lastSeenAt || null,
+    isAdmin: Boolean(user.isAdmin),
+    isGuest: Boolean(user.isGuest),
+  };
+}
+
+function normalizeChat(chat) {
+  if (!chat) return null;
+  return {
+    id: ensureChatIdString(chat._id || chat.id) || '',
+    type: chat.type || 'direct',
+    name: chat.name || null,
+    participants: Array.isArray(chat.participants)
+      ? chat.participants.map((p) => (typeof p === 'object' ? normalizeUser(p) : String(p)))
+      : [],
+    lastMessage: chat.lastMessage ? normalizeMessage(chat.lastMessage) : null,
+    unreadCount: chat.unreadCount || 0,
+    createdAt: chat.createdAt || new Date().toISOString(),
+    updatedAt: chat.updatedAt || chat.createdAt || new Date().toISOString(),
+  };
+}
+
+// ============================================================================
+// SECTION 4: SOCKET EVENT BUILDER
+// ============================================================================
+
+function buildSocketEvent(type, data, meta = {}) {
+  return {
+    type,
+    data,
+    meta: {
+      chatId: meta.chatId ? ensureChatIdString(meta.chatId) : null,
+      userId: meta.userId ? String(meta.userId) : null,
+      timestamp: meta.timestamp || new Date().toISOString(),
+    },
+  };
+}
+
+function safeEmit(io, room, event, payload) {
+  try {
+    if (room) io.to(room).emit(event, payload);
+  } catch (err) {
+    console.error(`[SafeEmit] Failed to emit ${event} to ${room}:`, err.message);
+  }
+}
+
+function safeSocketEmit(socket, event, payload) {
+  try {
+    if (socket && socket.connected) socket.emit(event, payload);
+  } catch (err) {
+    console.error(`[SafeSocketEmit] Failed to emit ${event}:`, err.message);
+  }
+}
+
+// ============================================================================
+// SECTION 5: IN-MEMORY CACHES & STATE
+// ============================================================================
+
+const onlineUsers = new Map();
+const typingState = new Map();
+const userCache = new Map();
+
+async function getCachedUser(db, userId) {
+  const cached = userCache.get(userId);
+  if (cached && Date.now() - cached.fetchedAt < CONFIG.cache.userTtlMs) return cached.data;
+  const oid = toObjectId(userId);
+  if (!oid) return null;
+  const user = await db.collection('users').findOne(
+    { _id: oid },
+    { projection: { username: 1, displayName: 1, avatar: 1, lastSeenAt: 1, isAdmin: 1, isGuest: 1 } }
+  );
+  if (user) {
+    const normalized = normalizeUser(user);
+    userCache.set(userId, { data: normalized, fetchedAt: Date.now() });
+    return normalized;
+  }
+  return null;
+}
+
+async function batchGetUsers(db, userIds) {
+  const results = new Map();
+  const toFetch = [];
+  for (const uid of userIds) {
+    const cached = userCache.get(uid);
+    if (cached && Date.now() - cached.fetchedAt < CONFIG.cache.userTtlMs) {
+      results.set(uid, cached.data);
+    } else {
+      toFetch.push(uid);
+    }
+  }
+  if (toFetch.length > 0) {
+    const oids = toFetch.map(toObjectId).filter(Boolean);
+    if (oids.length > 0) {
+      const users = await db
+        .collection('users')
+        .find({ _id: { $in: oids } }, { projection: { username: 1, displayName: 1, avatar: 1, lastSeenAt: 1, isAdmin: 1, isGuest: 1 } })
+        .toArray();
+      for (const user of users) {
+        const normalized = normalizeUser(user);
+        const uid = String(user._id);
+        userCache.set(uid, { data: normalized, fetchedAt: Date.now() });
+        results.set(uid, normalized);
+      }
+    }
+  }
+  return results;
+}
+
+function invalidateUserCache(userId) {
+  userCache.delete(userId);
+}
+
+// ============================================================================
+// SECTION 6: ONLINE STATUS MANAGEMENT
+// ============================================================================
+
+function setUserOnline(io, db, userId, socketId) {
+  let entry = onlineUsers.get(userId);
+  if (!entry) {
+    entry = { socketIds: new Set(), isOnline: false, lastSeenAt: new Date(), debounceTimer: null };
+    onlineUsers.set(userId, entry);
+  }
+  entry.socketIds.add(socketId);
+  if (entry.debounceTimer) clearTimeout(entry.debounceTimer);
+  if (!entry.isOnline) {
+    entry.debounceTimer = setTimeout(async () => {
+      entry.isOnline = true;
+      entry.lastSeenAt = new Date();
+      const oid = toObjectId(userId);
+      if (oid) {
+        await db.collection('users').updateOne({ _id: oid }, { $set: { isOnline: true, lastSeenAt: entry.lastSeenAt } }).catch(() => {});
+      }
+      invalidateUserCache(userId);
+      const event = buildSocketEvent('user:online', { user: { id: userId, isOnline: true, lastSeenAt: entry.lastSeenAt.toISOString() } }, { userId });
+      safeEmit(io, `user:${userId}:friends`, 'user:online', event);
+    }, CONFIG.onlineStatus.debounceMs);
+  }
+}
+
+function setUserOffline(io, db, userId, socketId) {
+  const entry = onlineUsers.get(userId);
+  if (!entry) return;
+  entry.socketIds.delete(socketId);
+  if (entry.socketIds.size === 0) {
+    if (entry.debounceTimer) clearTimeout(entry.debounceTimer);
+    entry.debounceTimer = setTimeout(async () => {
+      if (entry.socketIds.size > 0) return;
+      entry.isOnline = false;
+      entry.lastSeenAt = new Date();
+      const oid = toObjectId(userId);
+      if (oid) {
+        await db.collection('users').updateOne({ _id: oid }, { $set: { isOnline: false, lastSeenAt: entry.lastSeenAt } }).catch(() => {});
+      }
+      invalidateUserCache(userId);
+      const event = buildSocketEvent('user:offline', { user: { id: userId, isOnline: false, lastSeenAt: entry.lastSeenAt.toISOString() } }, { userId });
+      safeEmit(io, `user:${userId}:friends`, 'user:offline', event);
+      onlineUsers.delete(userId);
+    }, CONFIG.onlineStatus.debounceMs);
+  }
+}
+
+// ============================================================================
+// SECTION 7: TYPING INDICATOR MANAGEMENT
+// ============================================================================
+
+function handleTypingStart(io, chatId, userId, username) {
+  const key = `${chatId}:${userId}`;
+  const now = Date.now();
+  const existing = typingState.get(key);
+  if (existing && now - existing.lastEmitAt < CONFIG.typing.throttleMs) {
+    clearTimeout(existing.timer);
+    existing.timer = setTimeout(() => handleTypingStop(io, chatId, userId, username), CONFIG.typing.expireMs);
+    return;
+  }
+  if (existing?.timer) clearTimeout(existing.timer);
+  const timer = setTimeout(() => handleTypingStop(io, chatId, userId, username), CONFIG.typing.expireMs);
+  typingState.set(key, { timer, lastEmitAt: now });
+  safeEmit(io, `chat:${chatId}`, 'typing:start', buildSocketEvent('typing:start', { username: username || 'Unknown' }, { chatId, userId }));
+}
+
+function handleTypingStop(io, chatId, userId, username) {
+  const key = `${chatId}:${userId}`;
+  const existing = typingState.get(key);
+  if (existing?.timer) clearTimeout(existing.timer);
+  typingState.delete(key);
+  safeEmit(io, `chat:${chatId}`, 'typing:stop', buildSocketEvent('typing:stop', { username: username || 'Unknown' }, { chatId, userId }));
+}
+
+// ============================================================================
+// SECTION 8: RESPONSE HELPERS
+// ============================================================================
+
+function errorResponse(res, status, message, errorCode = null) {
+  const body = { success: false, message };
+  if (errorCode) body.errorCode = errorCode;
+  return res.status(status).json(body);
+}
+
+function successResponse(res, data, status = 200) {
   return res.status(status).json({ success: true, ...data });
 }
 
-function fail(res, message = "Something went wrong", status = 400) {
-  return res.status(status).json({ success: false, message });
+// ============================================================================
+// SECTION 9: AUTH HELPERS
+// ============================================================================
+
+function authMiddleware(db) {
+  return async (req, res, next) => {
+    try {
+      const authHeader = req.headers.authorization;
+      if (!authHeader || !authHeader.startsWith('Bearer ')) {
+        return errorResponse(res, 401, 'Authentication required', 'AUTH_REQUIRED');
+      }
+      const token = authHeader.split(' ')[1];
+      if (!token) return errorResponse(res, 401, 'Invalid token', 'INVALID_TOKEN');
+
+      const session = await db.collection('sessions').findOne({ token }, { projection: { userId: 1 } });
+      if (!session) return errorResponse(res, 401, 'Session expired or invalid', 'SESSION_EXPIRED');
+
+      const user = await getCachedUser(db, String(session.userId));
+      if (!user) return errorResponse(res, 401, 'User not found', 'USER_NOT_FOUND');
+
+      req.user = {
+        id: user.id,
+        username: user.username,
+        displayName: user.displayName,
+        avatar: user.avatar,
+        isAdmin: Boolean(user.isAdmin),
+        isGuest: Boolean(user.isGuest),
+      };
+      req.userId = user.id;
+      next();
+    } catch (err) {
+      console.error('[Auth] Error:', err.message);
+      return errorResponse(res, 500, 'Authentication error', 'AUTH_ERROR');
+    }
+  };
 }
 
-function generateToken(userId) {
-  return jwt.sign({ userId: toStr(userId) }, JWT_SECRET, { expiresIn: TOKEN_TTL });
+function requireAdmin(req, res, next) {
+  if (!req.user) return errorResponse(res, 401, 'Authentication required', 'AUTH_REQUIRED');
+  if (!req.user.isAdmin) return errorResponse(res, 403, 'Admin access required', 'ADMIN_ONLY');
+  next();
 }
 
-function verifyToken(token) {
-  return jwt.verify(token, JWT_SECRET);
+function blockGuests(req, res, next) {
+  if (req.user?.isGuest) return errorResponse(res, 403, 'Guest accounts cannot perform this action', 'GUEST_FORBIDDEN');
+  next();
 }
 
-function safeUser(user) {
-  if (!user) return null;
-  const { passwordHash, usernameLower, ...rest } = user;
-  return { ...rest, id: toStr(rest._id), _id: undefined };
+function generateToken() {
+  return crypto.randomBytes(32).toString('hex');
 }
 
-function addOnlineSocket(userId, socketId) {
-  const key = String(userId);
-  const current = onlineUsers.get(key) || new Set();
-  current.add(socketId);
-  onlineUsers.set(key, current);
+async function createSession(db, userId) {
+  const token = generateToken();
+  await db.collection('sessions').insertOne({ token, userId: String(userId), createdAt: new Date() });
+  return token;
 }
 
-function removeOnlineSocket(userId, socketId) {
-  const key = String(userId);
-  const current = onlineUsers.get(key);
-  if (!current) return;
-  current.delete(socketId);
-  if (!current.size) onlineUsers.delete(key);
-}
+// ============================================================================
+// SECTION 10: SERVER START
+// ============================================================================
 
-function getOnlineSocketId(userId) {
-  const key = String(userId);
-  const current = onlineUsers.get(key);
-  if (!current || !current.size) return null;
-  const [sid] = current;
-  return sid || null;
-}
+async function startServer() {
+  const mongoClient = new MongoClient(CONFIG.mongoUri);
+  await mongoClient.connect();
+  const db = mongoClient.db(CONFIG.dbName);
+  console.log('[MongoDB] Connected to', CONFIG.dbName);
 
-// --- AUTH MIDDLEWARE ------------------------------------------
+  await Promise.all([
+    db.collection('messages').createIndex({ chatId: 1, createdAt: -1 }),
+    db.collection('messages').createIndex({ clientMessageId: 1 }, { unique: true, sparse: true }),
+    db.collection('chats').createIndex({ participants: 1 }),
+    db.collection('users').createIndex({ username: 1 }, { unique: true }),
+    db.collection('users').createIndex({ usernameLower: 1 }, { unique: true, sparse: true }),
+    db.collection('users').createIndex({ displayName: 1 }),
+    db.collection('sessions').createIndex({ token: 1 }, { unique: true }),
+    db.collection('forgotPasswordRequests').createIndex({ status: 1, createdAt: -1 }),
+    db.collection('forgotPasswordRequests').createIndex(
+      { username: 1, whatsapp: 1, status: 1 },
+      { partialFilterExpression: { status: 'pending' } }
+    ),
+  ]).catch((err) => console.warn('[MongoDB] Index warning:', err.message));
 
-async function requireAuth(req, res, next) {
-  try {
-    const header = req.headers["authorization"] || "";
-    const token = header.startsWith("Bearer ") ? header.slice(7) : null;
-    if (!token) return fail(res, "No token provided", 401);
+  const app = express();
+  const httpServer = createServer(app);
 
-    const payload = verifyToken(token);
-    const userId = toObjectId(payload.userId);
-    if (!userId) return fail(res, "Invalid token", 401);
-    const user = await db.collection("users").findOne({ _id: userId });
-    if (!user) return fail(res, "User not found", 401);
+  app.use(express.json({ limit: CONFIG.validation.maxPayloadSize }));
 
-    req.user = user;
+  // CORS
+  app.use((req, res, next) => {
+    res.header('Access-Control-Allow-Origin', CONFIG.cors.origin);
+    res.header('Access-Control-Allow-Methods', CONFIG.cors.methods.join(','));
+    res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    res.header('Access-Control-Allow-Credentials', 'true');
+    if (req.method === 'OPTIONS') return res.sendStatus(204);
     next();
-  } catch (err) {
-    return fail(res, "Invalid or expired token", 401);
-  }
-}
+  });
 
-// --- VALIDATION HELPERS ---------------------------------------
+  const auth = authMiddleware(db);
 
-function validateUsername(username) {
-  if (!username || typeof username !== "string") return "Username is required";
-  if (username.length < 3 || username.length > 32) return "Username must be 3-32 characters";
-  if (!/^[a-zA-Z0-9_.-]+$/.test(username)) return "Username may only contain letters, numbers, _, ., -";
-  return null;
-}
+  const io = new Server(httpServer, {
+    cors: CONFIG.cors,
+    pingTimeout: 60000,
+    pingInterval: 25000,
+    maxHttpBufferSize: 1e6,
+  });
 
-function validatePassword(password) {
-  if (!password || typeof password !== "string") return "Password is required";
-  if (password.length < 6) return "Password must be at least 6 characters";
-  return null;
-}
+  // ==========================================================================
+  // SECTION 11a: AUTH ROUTES
+  // ==========================================================================
 
-// ===============================================================
-//  AUTH ROUTES
-// ===============================================================
+  // POST /api/auth/register
+  app.post('/api/auth/register', async (req, res) => {
+    try {
+      let { username, displayName, password, avatar } = req.body;
 
-// POST /auth/register
-app.post("/auth/register", async (req, res) => {
-  try {
-    let { username, displayName, password, avatarUrl } = req.body;
+      if (!isValidUsername(username)) {
+        return errorResponse(res, 400, 'Username must be 3-50 chars (letters, numbers, _ . -)', 'INVALID_USERNAME');
+      }
+      if (!password || typeof password !== 'string' || password.length < 6) {
+        return errorResponse(res, 400, 'Password must be at least 6 characters', 'INVALID_PASSWORD');
+      }
 
-    const usernameErr = validateUsername(username);
-    if (usernameErr) return fail(res, usernameErr);
+      const usernameLower = username.toLowerCase();
+      displayName = sanitizeText(displayName || username, CONFIG.validation.maxUsernameLength);
+      avatar = avatar || `https://api.dicebear.com/7.x/thumbs/svg?seed=${usernameLower}`;
 
-    const passwordErr = validatePassword(password);
-    if (passwordErr) return fail(res, passwordErr);
+      const existing = await db.collection('users').findOne({ usernameLower });
+      if (existing) return errorResponse(res, 409, 'Username already taken', 'USERNAME_TAKEN');
 
-    const usernameLower = username.toLowerCase();
-    displayName = displayName?.trim() || username;
-    avatarUrl = avatarUrl || `https://api.dicebear.com/7.x/thumbs/svg?seed=${usernameLower}`;
+      const passwordHash = await bcrypt.hash(password, SALT_ROUNDS);
+      const now = new Date();
 
-    const existing = await db.collection("users").findOne({ usernameLower });
-    if (existing) return fail(res, "Username already taken");
+      const result = await db.collection('users').insertOne({
+        username,
+        usernameLower,
+        displayName,
+        passwordHash,
+        avatar,
+        isAdmin: false,
+        isGuest: false,
+        isOnline: false,
+        createdAt: now,
+        lastSeenAt: now,
+      });
 
-    const passwordHash = await bcrypt.hash(password, SALT_ROUNDS);
-    const now = new Date();
+      const token = await createSession(db, result.insertedId);
 
-    const insertResult = await db.collection("users").insertOne({
-      username,
-      usernameLower,
-      displayName,
-      passwordHash,
-      avatarUrl,
-      createdAt: now,
-      lastSeenAt: now,
-    });
-
-    const userId = insertResult.insertedId;
-    const token = generateToken(userId);
-
-    return ok(
-      res,
-      {
+      successResponse(res, {
         token,
         user: {
-          id: toStr(userId),
+          id: String(result.insertedId),
           username,
           displayName,
-          avatarUrl,
-          createdAt: now,
-          lastSeenAt: now,
+          avatar,
+          isAdmin: false,
+          isGuest: false,
+          createdAt: now.toISOString(),
         },
-      },
-      201
-    );
-  } catch (err) {
-    if (err.code === 11000) return fail(res, "Username already taken");
-    console.error("[register]", err);
-    return fail(res, "Registration failed", 500);
-  }
-});
-
-// POST /auth/login
-app.post("/auth/login", async (req, res) => {
-  try {
-    const { username, password } = req.body;
-
-    if (!username || !password) return fail(res, "Username and password required");
-
-    const user = await db.collection("users").findOne({ usernameLower: username.toLowerCase() });
-    if (!user) return fail(res, "Invalid credentials", 401);
-
-    const match = await bcrypt.compare(password, user.passwordHash);
-    if (!match) return fail(res, "Invalid credentials", 401);
-
-    await db.collection("users").updateOne({ _id: user._id }, { $set: { lastSeenAt: new Date() } });
-
-    const token = generateToken(user._id);
-    return ok(res, { token, user: safeUser(user) });
-  } catch (err) {
-    console.error("[login]", err);
-    return fail(res, "Login failed", 500);
-  }
-});
-
-// GET /auth/me
-app.get("/auth/me", requireAuth, (req, res) => {
-  return ok(res, { user: safeUser(req.user) });
-});
-
-// PATCH /auth/me  -- update profile
-app.patch("/auth/me", requireAuth, async (req, res) => {
-  try {
-    const { displayName, avatarUrl } = req.body;
-    const updates = {};
-    if (displayName) updates.displayName = displayName.trim();
-    if (avatarUrl) updates.avatarUrl = avatarUrl.trim();
-
-    if (!Object.keys(updates).length) return fail(res, "Nothing to update");
-
-    await db.collection("users").updateOne({ _id: req.user._id }, { $set: updates });
-    const updated = await db.collection("users").findOne({ _id: req.user._id });
-    return ok(res, { user: safeUser(updated) });
-  } catch (err) {
-    console.error("[update profile]", err);
-    return fail(res, "Profile update failed", 500);
-  }
-});
-
-// ===============================================================
-//  USER ROUTES
-// ===============================================================
-
-// GET /users/search?q=username
-app.get("/users/search", requireAuth, async (req, res) => {
-  try {
-    const q = (req.query.q || "").toLowerCase().trim();
-    if (!q || q.length < 2) return fail(res, "Query too short");
-    const safe = escapeRegex(q);
-
-    const users = await db
-      .collection("users")
-      .find({ usernameLower: { $regex: `^${safe}`, $options: "i" } })
-      .limit(20)
-      .toArray();
-
-    return ok(res, { users: users.map(safeUser) });
-  } catch (err) {
-    console.error("[search users]", err);
-    return fail(res, "Search failed", 500);
-  }
-});
-
-// GET /users/:id
-app.get("/users/:id", requireAuth, async (req, res) => {
-  try {
-    const userId = toObjectId(req.params.id);
-    if (!userId) return fail(res, "User not found", 404);
-    const user = await db.collection("users").findOne({ _id: userId });
-    if (!user) return fail(res, "User not found", 404);
-    return ok(res, { user: safeUser(user) });
-  } catch (err) {
-    return fail(res, "User not found", 404);
-  }
-});
-
-// ===============================================================
-//  FRIEND SYSTEM
-// ===============================================================
-//
-//  friends collection document:
-//  {
-//    userA, userB,          // always sorted so userA < userB (string comparison)
-//    canonicalKey,          // "userA:userB"
-//    status,                // "pending" | "friends" | "blocked"
-//    requestedBy,           // userId who sent the request
-//    blockedBy,             // userId who blocked (if blocked)
-//    createdAt, updatedAt
-//  }
-
-function sortedPair(idA, idB) {
-  const [a, b] = [toStr(idA), toStr(idB)].sort();
-  return { userA: a, userB: b, canonicalKey: `${a}:${b}` };
-}
-
-async function getFriendStatus(meId, otherId) {
-  const { canonicalKey } = sortedPair(meId, otherId);
-  const doc = await db.collection("friends").findOne({ canonicalKey });
-  if (!doc) return { status: "none", doc: null };
-
-  const meStr = toStr(meId);
-  const otherStr = toStr(otherId);
-
-  if (doc.status === "blocked") {
-    if (doc.blockedBy === meStr) return { status: "blocked_by_me", doc };
-    return { status: "blocked_by_them", doc };
-  }
-  if (doc.status === "pending") {
-    if (doc.requestedBy === meStr) return { status: "outgoing", doc };
-    return { status: "incoming", doc };
-  }
-  if (doc.status === "friends") return { status: "friends", doc };
-  return { status: "none", doc };
-}
-
-// POST /friends/request
-app.post("/friends/request", requireAuth, async (req, res) => {
-  try {
-    const { userId } = req.body;
-    if (!userId) return fail(res, "userId required");
-    if (toStr(req.user._id) === toStr(userId)) return fail(res, "Cannot friend yourself");
-
-    const targetId = toObjectId(userId);
-    if (!targetId) return fail(res, "User not found", 404);
-    const target = await db.collection("users").findOne({ _id: targetId });
-    if (!target) return fail(res, "User not found", 404);
-
-    const pair = sortedPair(req.user._id, userId);
-    const existing = await db.collection("friends").findOne({ canonicalKey: pair.canonicalKey });
-
-    if (existing) {
-      if (existing.status === "friends") return fail(res, "Already friends");
-      if (existing.status === "pending") return fail(res, "Request already exists");
-      if (existing.status === "blocked") return fail(res, "Cannot send request");
-    }
-
-    const now = new Date();
-    await db.collection("friends").insertOne({
-      ...pair,
-      status: "pending",
-      requestedBy: toStr(req.user._id),
-      blockedBy: null,
-      createdAt: now,
-      updatedAt: now,
-    });
-
-    // real-time notify target
-    const targetSocketId = getOnlineSocketId(toStr(userId));
-    if (targetSocketId) {
-      io.to(targetSocketId).emit("friend:request", {
-        from: safeUser(req.user),
-      });
-    }
-
-    return ok(res, { message: "Friend request sent" }, 201);
-  } catch (err) {
-    console.error("[friend request]", err);
-    return fail(res, "Failed to send request", 500);
-  }
-});
-
-// POST /friends/accept
-app.post("/friends/accept", requireAuth, async (req, res) => {
-  try {
-    const { userId } = req.body;
-    if (!userId) return fail(res, "userId required");
-
-    const pair = sortedPair(req.user._id, userId);
-    const doc = await db.collection("friends").findOne({ canonicalKey: pair.canonicalKey });
-
-    if (!doc || doc.status !== "pending") return fail(res, "No pending request found");
-    if (doc.requestedBy === toStr(req.user._id)) return fail(res, "Cannot accept your own request");
-
-    await db.collection("friends").updateOne(
-      { canonicalKey: pair.canonicalKey },
-      { $set: { status: "friends", updatedAt: new Date() } }
-    );
-
-    const targetSocketId = getOnlineSocketId(toStr(userId));
-    if (targetSocketId) {
-      io.to(targetSocketId).emit("friend:accepted", { by: safeUser(req.user) });
-    }
-
-    return ok(res, { message: "Friend request accepted" });
-  } catch (err) {
-    console.error("[friend accept]", err);
-    return fail(res, "Failed to accept request", 500);
-  }
-});
-
-// POST /friends/reject
-app.post("/friends/reject", requireAuth, async (req, res) => {
-  try {
-    const { userId } = req.body;
-    if (!userId) return fail(res, "userId required");
-
-    const pair = sortedPair(req.user._id, userId);
-    await db.collection("friends").deleteOne({ canonicalKey: pair.canonicalKey, status: "pending" });
-
-    return ok(res, { message: "Friend request rejected" });
-  } catch (err) {
-    console.error("[friend reject]", err);
-    return fail(res, "Failed to reject request", 500);
-  }
-});
-
-// POST /friends/block
-app.post("/friends/block", requireAuth, async (req, res) => {
-  try {
-    const { userId } = req.body;
-    if (!userId) return fail(res, "userId required");
-
-    const pair = sortedPair(req.user._id, userId);
-    const meStr = toStr(req.user._id);
-    const now = new Date();
-
-    await db.collection("friends").updateOne(
-      { canonicalKey: pair.canonicalKey },
-      {
-        $set: {
-          ...pair,
-          status: "blocked",
-          blockedBy: meStr,
-          updatedAt: now,
-        },
-        $setOnInsert: { requestedBy: null, createdAt: now },
-      },
-      { upsert: true }
-    );
-
-    return ok(res, { message: "User blocked" });
-  } catch (err) {
-    console.error("[block]", err);
-    return fail(res, "Failed to block user", 500);
-  }
-});
-
-// POST /friends/unblock
-app.post("/friends/unblock", requireAuth, async (req, res) => {
-  try {
-    const { userId } = req.body;
-    if (!userId) return fail(res, "userId required");
-
-    const pair = sortedPair(req.user._id, userId);
-    const doc = await db.collection("friends").findOne({ canonicalKey: pair.canonicalKey });
-
-    if (!doc || doc.status !== "blocked") return fail(res, "User is not blocked");
-    if (doc.blockedBy !== toStr(req.user._id)) return fail(res, "You did not block this user");
-
-    await db.collection("friends").deleteOne({ canonicalKey: pair.canonicalKey });
-    return ok(res, { message: "User unblocked" });
-  } catch (err) {
-    console.error("[unblock]", err);
-    return fail(res, "Failed to unblock user", 500);
-  }
-});
-
-// GET /friends  -- list all friends of current user
-app.get("/friends", requireAuth, async (req, res) => {
-  try {
-    const meStr = toStr(req.user._id);
-    const docs = await db
-      .collection("friends")
-      .find({
-        $or: [{ userA: meStr }, { userB: meStr }],
-        status: "friends",
-      })
-      .toArray();
-
-    const friendIds = docs.map((d) => {
-      const otherId = d.userA === meStr ? d.userB : d.userA;
-      return toObjectId(otherId);
-    }).filter(Boolean);
-
-    if (!friendIds.length) return ok(res, { friends: [] });
-
-    const users = await db
-      .collection("users")
-      .find({ _id: { $in: friendIds } })
-      .toArray();
-
-    return ok(res, { friends: users.map(safeUser) });
-  } catch (err) {
-    console.error("[list friends]", err);
-    return fail(res, "Failed to list friends", 500);
-  }
-});
-
-// GET /friends/requests  -- incoming + outgoing
-app.get("/friends/requests", requireAuth, async (req, res) => {
-  try {
-    const meStr = toStr(req.user._id);
-    const docs = await db
-      .collection("friends")
-      .find({
-        $or: [{ userA: meStr }, { userB: meStr }],
-        status: "pending",
-      })
-      .toArray();
-
-    const incoming = [];
-    const outgoing = [];
-    const otherIds = docs
-      .map((d) => (d.userA === meStr ? d.userB : d.userA))
-      .map(toObjectId)
-      .filter(Boolean);
-    const users = otherIds.length
-      ? await db.collection("users").find({ _id: { $in: otherIds } }).toArray()
-      : [];
-    const userById = new Map(users.map((u) => [toStr(u._id), safeUser(u)]));
-
-    docs.forEach((d) => {
-      const otherId = d.userA === meStr ? d.userB : d.userA;
-      const user = userById.get(String(otherId));
-      if (!user) return;
-      if (d.requestedBy === meStr) outgoing.push(user);
-      else incoming.push(user);
-    });
-
-    return ok(res, { incoming, outgoing });
-  } catch (err) {
-    console.error("[friend requests]", err);
-    return fail(res, "Failed to fetch requests", 500);
-  }
-});
-
-// GET /friends/status/:userId
-app.get("/friends/status/:userId", requireAuth, async (req, res) => {
-  try {
-    const { status } = await getFriendStatus(req.user._id, req.params.userId);
-    return ok(res, { status });
-  } catch (err) {
-    return fail(res, "Failed to get status", 500);
-  }
-});
-
-// ===============================================================
-//  CHAT ROUTES
-// ===============================================================
-//
-//  Chat document:
-//  {
-//    _id, type ("dm" | "group"),
-//    canonicalKey (DM only),
-//    name (group only),
-//    avatarUrl (group only),
-//    members: [userId strings],
-//    ownerId (group only),
-//    admins: [] (group only),
-//    createdAt, updatedAt,
-//    lastMessage: { content, senderId, createdAt }
-//  }
-
-// POST /chats/create
-app.post("/chats/create", requireAuth, async (req, res) => {
-  try {
-    const { type, userId, name, avatarUrl, members } = req.body;
-    const meStr = toStr(req.user._id);
-    const now = new Date();
-
-    // -- DM --
-    if (type === "dm") {
-      if (!userId) return fail(res, "userId required for DM");
-      if (userId === meStr) return fail(res, "Cannot DM yourself");
-
-      const targetId = toObjectId(userId);
-      if (!targetId) return fail(res, "User not found", 404);
-      const target = await db.collection("users").findOne({ _id: targetId });
-      if (!target) return fail(res, "User not found", 404);
-
-      const canonicalKey = sortedPairKey(meStr, userId);
-      const existing = await db.collection("chats").findOne({ canonicalKey });
-      if (existing) return ok(res, { chat: { ...existing, id: toStr(existing._id) } });
-
-      const insertResult = await db.collection("chats").insertOne({
-        type: "dm",
-        canonicalKey,
-        members: [meStr, userId],
-        createdAt: now,
-        updatedAt: now,
-        lastMessage: null,
-      });
-
-      const chat = await db.collection("chats").findOne({ _id: insertResult.insertedId });
-      return ok(res, { chat: { ...chat, id: toStr(chat._id) } }, 201);
-    }
-
-    // -- GROUP --
-    if (type === "group") {
-      if (!name || !name.trim()) return fail(res, "Group name required");
-
-      const memberIds = Array.isArray(members) ? [...new Set([meStr, ...members])] : [meStr];
-
-      const insertResult = await db.collection("chats").insertOne({
-        type: "group",
-        name: name.trim(),
-        avatarUrl: avatarUrl || `https://api.dicebear.com/7.x/identicon/svg?seed=${Date.now()}`,
-        members: memberIds,
-        ownerId: meStr,
-        admins: [meStr],
-        createdAt: now,
-        updatedAt: now,
-        lastMessage: null,
-      });
-
-      const chat = await db.collection("chats").findOne({ _id: insertResult.insertedId });
-      return ok(res, { chat: { ...chat, id: toStr(chat._id) } }, 201);
-    }
-
-    return fail(res, "type must be 'dm' or 'group'");
-  } catch (err) {
-    console.error("[create chat]", err);
-    return fail(res, "Failed to create chat", 500);
-  }
-});
-
-// GET /chats/:id
-app.get("/chats/:id", requireAuth, async (req, res) => {
-  try {
-    const chatId = toObjectId(req.params.id);
-    if (!chatId) return fail(res, "Chat not found", 404);
-    const chat = await db.collection("chats").findOne({ _id: chatId });
-    if (!chat) return fail(res, "Chat not found", 404);
-
-    const meStr = toStr(req.user._id);
-    if (!chat.members.includes(meStr)) return fail(res, "Not a member", 403);
-
-    return ok(res, { chat: { ...chat, id: toStr(chat._id) } });
-  } catch (err) {
-    return fail(res, "Chat not found", 404);
-  }
-});
-
-// GET /chats  -- list my chats
-app.get("/chats", requireAuth, async (req, res) => {
-  try {
-    const meStr = toStr(req.user._id);
-    const chats = await db.collection("chats").find({ members: meStr }).sort({ updatedAt: -1 }).toArray();
-
-    return ok(res, { chats: chats.map((c) => ({ ...c, id: toStr(c._id) })) });
-  } catch (err) {
-    console.error("[list chats]", err);
-    return fail(res, "Failed to list chats", 500);
-  }
-});
-
-// PATCH /chats/:id  -- rename group, change avatar
-app.patch("/chats/:id", requireAuth, async (req, res) => {
-  try {
-    const chatId = toObjectId(req.params.id);
-    if (!chatId) return fail(res, "Chat not found", 404);
-    const chat = await db.collection("chats").findOne({ _id: chatId });
-    if (!chat) return fail(res, "Chat not found", 404);
-    if (chat.type !== "group") return fail(res, "Only group chats can be updated");
-
-    const meStr = toStr(req.user._id);
-    if (!chat.admins.includes(meStr)) return fail(res, "Admin only", 403);
-
-    const { name, avatarUrl } = req.body;
-    const updates = { updatedAt: new Date() };
-    if (name) updates.name = name.trim();
-    if (avatarUrl) updates.avatarUrl = avatarUrl;
-
-    await db.collection("chats").updateOne({ _id: chat._id }, { $set: updates });
-    const updated = await db.collection("chats").findOne({ _id: chat._id });
-    return ok(res, { chat: { ...updated, id: toStr(updated._id) } });
-  } catch (err) {
-    console.error("[update chat]", err);
-    return fail(res, "Failed to update chat", 500);
-  }
-});
-
-// POST /chats/:id/members  -- add member (admin only)
-app.post("/chats/:id/members", requireAuth, async (req, res) => {
-  try {
-    const chatId = toObjectId(req.params.id);
-    if (!chatId) return fail(res, "Chat not found", 404);
-    const chat = await db.collection("chats").findOne({ _id: chatId });
-    if (!chat) return fail(res, "Chat not found", 404);
-    if (chat.type !== "group") return fail(res, "Only for groups");
-
-    const meStr = toStr(req.user._id);
-    if (!chat.admins.includes(meStr)) return fail(res, "Admin only", 403);
-
-    const { userId } = req.body;
-    if (!userId) return fail(res, "userId required");
-    if (chat.members.includes(userId)) return fail(res, "Already a member");
-
-    await db.collection("chats").updateOne(
-      { _id: chat._id },
-      { $push: { members: userId }, $set: { updatedAt: new Date() } }
-    );
-
-    return ok(res, { message: "Member added" });
-  } catch (err) {
-    return fail(res, "Failed to add member", 500);
-  }
-});
-
-// DELETE /chats/:id/members/:userId  -- remove member
-app.delete("/chats/:id/members/:userId", requireAuth, async (req, res) => {
-  try {
-    const chatId = toObjectId(req.params.id);
-    if (!chatId) return fail(res, "Chat not found", 404);
-    const chat = await db.collection("chats").findOne({ _id: chatId });
-    if (!chat) return fail(res, "Chat not found", 404);
-    if (chat.type !== "group") return fail(res, "Only for groups");
-
-    const meStr = toStr(req.user._id);
-    const targetStr = req.params.userId;
-
-    // must be admin OR removing yourself (leave)
-    if (!chat.admins.includes(meStr) && meStr !== targetStr) {
-      return fail(res, "Admin only", 403);
-    }
-
-    await db.collection("chats").updateOne(
-      { _id: chat._id },
-      { $pull: { members: targetStr, admins: targetStr }, $set: { updatedAt: new Date() } }
-    );
-
-    return ok(res, { message: "Member removed" });
-  } catch (err) {
-    return fail(res, "Failed to remove member", 500);
-  }
-});
-
-// ===============================================================
-//  MESSAGE ROUTES
-// ===============================================================
-
-// -- Mention parser --
-async function parseMentions(content, chatMembers) {
-  const mentionedUserIds = [];
-  let hasEveryone = false;
-  let hasHere = false;
-
-  if (/@everyone/.test(content)) hasEveryone = true;
-  if (/@here/.test(content)) hasHere = true;
-
-  const matches = [...content.matchAll(/@([a-zA-Z0-9_.-]+)/g)];
-  for (const [, uname] of matches) {
-    if (uname === "everyone" || uname === "here") continue;
-    const user = await db.collection("users").findOne({ usernameLower: uname.toLowerCase() });
-    if (user && chatMembers.includes(toStr(user._id))) {
-      if (!mentionedUserIds.includes(toStr(user._id))) {
-        mentionedUserIds.push(toStr(user._id));
-      }
-    }
-  }
-
-  return { mentionedUserIds, hasEveryone, hasHere };
-}
-
-// POST /messages/send
-app.post("/messages/send", requireAuth, async (req, res) => {
-  try {
-    const { chatId, content, attachments, replyToId } = req.body;
-    if (!chatId) return fail(res, "chatId required");
-    if (!content && (!attachments || !attachments.length)) {
-      return fail(res, "Message cannot be empty");
-    }
-
-    const chatObjectId = toObjectId(chatId);
-    if (!chatObjectId) return fail(res, "Chat not found", 404);
-    const chat = await db.collection("chats").findOne({ _id: chatObjectId });
-    if (!chat) return fail(res, "Chat not found", 404);
-
-    const meStr = toStr(req.user._id);
-    if (!chat.members.includes(meStr)) return fail(res, "Not a member", 403);
-
-    const messageContent = (content || "").trim();
-    const { mentionedUserIds, hasEveryone, hasHere } = await parseMentions(messageContent, chat.members);
-
-    const now = new Date();
-    const message = {
-      chatId: chatId,
-      senderId: meStr,
-      content: messageContent,
-      attachments: Array.isArray(attachments) ? attachments : [],
-      reactions: {},
-      mentionedUserIds,
-      hasEveryone,
-      hasHere,
-      replyToId: replyToId || null,
-      createdAt: now,
-      editedAt: null,
-      deletedAt: null,
-    };
-
-    const insertResult = await db.collection("messages").insertOne(message);
-    const savedMsg = { ...message, id: toStr(insertResult.insertedId), _id: insertResult.insertedId };
-
-    // update chat lastMessage
-    await db.collection("chats").updateOne(
-      { _id: chat._id },
-      {
-        $set: {
-          updatedAt: now,
-          lastMessage: { content: messageContent, senderId: meStr, createdAt: now },
-        },
-      }
-    );
-
-    // broadcast to chat room
-    io.to(chatId).emit("message:new", { ...savedMsg, _id: undefined, id: toStr(insertResult.insertedId) });
-
-    // notify mentioned users
-    for (const uid of mentionedUserIds) {
-      const socketId = onlineUsers.get(uid);
-      if (socketId) {
-        io.to(socketId).emit("mention:received", {
-          chatId,
-          messageId: toStr(insertResult.insertedId),
-          from: safeUser(req.user),
-        });
-      }
-    }
-
-    return ok(res, { message: { ...savedMsg, _id: undefined } }, 201);
-  } catch (err) {
-    console.error("[send message]", err);
-    return fail(res, "Failed to send message", 500);
-  }
-});
-
-// GET /messages/:chatId -- chatId is always a string (e.g. "study-general", "userA:userB")
-app.get("/messages/:chatId", requireAuth, async (req, res) => {
-  try {
-    const chatId = String(req.params.chatId ?? "");
-    const meStr = toStr(req.user._id);
-    console.log("[messages] fetch chatId=%s user=%s", chatId, meStr);
-
-    // Safe membership: resolve chat by canonicalKey or valid ObjectId string only (never throw on invalid id)
-    let chat = null;
-    try {
-      if (chatId.length === 24 && ObjectId.isValid(chatId)) {
-        chat = await db.collection("chats").findOne({ _id: new ObjectId(chatId) });
-      }
-    } catch (lookupErr) {
-      console.error("[messages] chat lookup by _id error", lookupErr);
-    }
-    if (!chat) {
-      try {
-        chat = await db.collection("chats").findOne({ canonicalKey: chatId });
-      } catch (lookupErr) {
-        console.error("[messages] chat lookup by canonicalKey error", lookupErr);
-      }
-    }
-    if (chat && Array.isArray(chat.members) && !chat.members.includes(meStr)) {
-      return fail(res, "Not a member", 403);
-    }
-
-    const limit = Math.min(parseInt(req.query.limit, 10) || 50, 100);
-    const before = req.query.before;
-    const query = { chatId, deletedAt: null };
-    if (before) {
-      try {
-        query.createdAt = { $lt: new Date(before) };
-      } catch (dateErr) {
-        console.error("[messages] invalid before cursor", dateErr);
-      }
-    }
-
-    const messages = await db.collection("messages").find(query).sort({ createdAt: 1 }).limit(limit).toArray();
-
-    const result = messages.map((m) => ({ ...m, id: toStr(m._id), _id: undefined }));
-    return ok(res, { messages: result });
-  } catch (err) {
-    console.error("[get messages] error (returning 500, server stays up)", err);
-    return res.status(500).json({ success: false, message: "Failed to get messages" });
-  }
-});
-
-// PATCH /messages/:id  -- edit message
-app.patch("/messages/:id", requireAuth, async (req, res) => {
-  try {
-    const { content } = req.body;
-    if (!content || !content.trim()) return fail(res, "Content required");
-
-    const messageId = toObjectId(req.params.id);
-    if (!messageId) return fail(res, "Message not found", 404);
-    const msg = await db.collection("messages").findOne({ _id: messageId });
-    if (!msg) return fail(res, "Message not found", 404);
-    if (msg.senderId !== toStr(req.user._id)) return fail(res, "Cannot edit others' messages", 403);
-    if (msg.deletedAt) return fail(res, "Cannot edit deleted message");
-
-    const now = new Date();
-    await db.collection("messages").updateOne({ _id: msg._id }, { $set: { content: content.trim(), editedAt: now } });
-
-    const updated = await db.collection("messages").findOne({ _id: msg._id });
-    const result = { ...updated, id: toStr(updated._id), _id: undefined };
-
-    io.to(msg.chatId).emit("message:update", result);
-    return ok(res, { message: result });
-  } catch (err) {
-    console.error("[edit message]", err);
-    return fail(res, "Failed to edit message", 500);
-  }
-});
-
-// DELETE /messages/:id  -- soft delete
-app.delete("/messages/:id", requireAuth, async (req, res) => {
-  try {
-    const messageId = toObjectId(req.params.id);
-    if (!messageId) return fail(res, "Message not found", 404);
-    const msg = await db.collection("messages").findOne({ _id: messageId });
-    if (!msg) return fail(res, "Message not found", 404);
-
-    const meStr = toStr(req.user._id);
-
-    // sender or group admin can delete
-    const chatObjectId = toObjectId(msg.chatId);
-    const chat = chatObjectId ? await db.collection("chats").findOne({ _id: chatObjectId }) : null;
-    const isAdmin = chat?.type === "group" && chat?.admins?.includes(meStr);
-    const isSender = msg.senderId === meStr;
-
-    if (!isSender && !isAdmin) return fail(res, "Cannot delete this message", 403);
-
-    await db.collection("messages").updateOne(
-      { _id: msg._id },
-      { $set: { deletedAt: new Date(), content: "This message was deleted." } }
-    );
-
-    io.to(msg.chatId).emit("message:delete", { id: toStr(msg._id), chatId: msg.chatId });
-    return ok(res, { message: "Message deleted" });
-  } catch (err) {
-    console.error("[delete message]", err);
-    return fail(res, "Failed to delete message", 500);
-  }
-});
-
-// ===============================================================
-//  REACTION SYSTEM
-// ===============================================================
-
-// POST /messages/react
-app.post("/messages/react", requireAuth, async (req, res) => {
-  try {
-    const { messageId, emoji } = req.body;
-    if (!messageId || !emoji) return fail(res, "messageId and emoji required");
-
-    const messageObjectId = toObjectId(messageId);
-    if (!messageObjectId) return fail(res, "Message not found", 404);
-    const msg = await db.collection("messages").findOne({ _id: messageObjectId });
-    if (!msg) return fail(res, "Message not found", 404);
-    if (msg.deletedAt) return fail(res, "Cannot react to deleted message");
-
-    // verify membership
-    const chatObjectId = toObjectId(msg.chatId);
-    const chat = chatObjectId ? await db.collection("chats").findOne({ _id: chatObjectId }) : null;
-    const meStr = toStr(req.user._id);
-    if (!chat || !chat.members.includes(meStr)) return fail(res, "Not a member", 403);
-
-    const reactions = msg.reactions || {};
-
-    // find if user already reacted with any emoji
-    let existingEmoji = null;
-    for (const [e, data] of Object.entries(reactions)) {
-      if (data.users && data.users.includes(meStr)) {
-        existingEmoji = e;
-        break;
-      }
-    }
-
-    if (existingEmoji === emoji) {
-      // same emoji -> REMOVE reaction
-      reactions[emoji].users = reactions[emoji].users.filter((u) => u !== meStr);
-      if (reactions[emoji].users.length === 0) delete reactions[emoji];
-    } else {
-      // remove from old emoji if any
-      if (existingEmoji) {
-        reactions[existingEmoji].users = reactions[existingEmoji].users.filter((u) => u !== meStr);
-        if (reactions[existingEmoji].users.length === 0) delete reactions[existingEmoji];
-      }
-      // add to new emoji
-      if (!reactions[emoji]) reactions[emoji] = { users: [] };
-      reactions[emoji].users.push(meStr);
-    }
-
-    await db.collection("messages").updateOne({ _id: msg._id }, { $set: { reactions } });
-
-    const reactionUpdate = { messageId, chatId: msg.chatId, reactions };
-    io.to(msg.chatId).emit("reaction:update", reactionUpdate);
-    return ok(res, { reactions });
-  } catch (err) {
-    console.error("[react]", err);
-    return fail(res, "Failed to react", 500);
-  }
-});
-
-// ===============================================================
-//  SOCKET.IO - REAL-TIME ENGINE
-// ===============================================================
-
-// Map: userId -> Set<socketId>  (online users)
-const onlineUsers = new Map();
-
-io.use(async (socket, next) => {
-  try {
-    // Token MUST come from handshake auth (matches Socket.IO client: io(url, { auth: { token } }))
-    const raw = socket.handshake.auth && socket.handshake.auth.token;
-    if (raw === undefined || raw === null || String(raw).trim() === "") {
-      console.warn("[Socket] connect rejected: missing auth.token");
-      return next(new Error("No token"));
-    }
-
-    let cleanToken = String(raw).trim();
-    if (cleanToken.startsWith("Bearer ")) cleanToken = cleanToken.slice(7).trim();
-
-    let decodedUser;
-    try {
-      decodedUser = verifyToken(cleanToken);
-    } catch (verifyErr) {
-      console.error("[Socket] JWT verify failed", verifyErr);
-      return next(new Error("Authentication failed"));
-    }
-
-    let user;
-    try {
-      const socketUserId = toObjectId(decodedUser.userId);
-      if (!socketUserId) return next(new Error("Authentication failed"));
-      user = await db.collection("users").findOne({ _id: socketUserId });
-    } catch (dbErr) {
-      console.error("[Socket] user load failed", dbErr);
-      return next(new Error("Authentication failed"));
-    }
-    if (!user) {
-      console.warn("[Socket] connect rejected: user not found for token");
-      return next(new Error("User not found"));
-    }
-
-    socket.user = decodedUser;
-    socket.userId = toStr(user._id);
-    socket.userData = user;
-    next();
-  } catch (err) {
-    console.error("[Socket] auth middleware unexpected error", err);
-    return next(new Error("Authentication failed"));
-  }
-});
-
-io.on("connection", async (socket) => {
-  const userId = socket.userId;
-  const uname = socket.userData && socket.userData.username;
-  console.log(`[Socket] Connected: ${uname || userId} (socket ${socket.id})`);
-
-  try {
-    // register as online
-    addOnlineSocket(userId, socket.id);
-
-    // update lastSeenAt
-    const socketUserId = toObjectId(userId);
-    if (socketUserId) {
-      await db.collection("users").updateOne({ _id: socketUserId }, { $set: { lastSeenAt: new Date() } });
-    }
-
-    // broadcast online status to friends
-    await broadcastOnlineStatus(socket, userId, true);
-
-    // auto-join all chat rooms user belongs to
-    const userChats = await db.collection("chats").find({ members: userId }).toArray();
-    for (const chat of userChats) {
-      socket.join(toStr(chat._id));
-    }
-    console.log(`[Socket] ${uname || userId} joined ${userChats.length} chat room(s)`);
-  } catch (setupErr) {
-    console.error("[Socket] post-connect setup failed (socket stays connected)", setupErr);
-  }
-
-  // -- join:chat -- (explicit join for newly created chats)
-  socket.on("join:chat", async (chatId) => {
-    const chatObjectId = toObjectId(chatId);
-    if (!chatObjectId) return;
-    try {
-      const chat = await db.collection("chats").findOne({ _id: chatObjectId }, { projection: { members: 1 } });
-      if (!chat || !Array.isArray(chat.members) || !chat.members.includes(userId)) return;
-      const roomId = toStr(chatObjectId);
-      socket.join(roomId);
-      console.log(`[Socket] ${uname || userId} joined room ${roomId}`);
-    } catch {
-      // noop
+      }, 201);
+    } catch (err) {
+      if (err.code === 11000) return errorResponse(res, 409, 'Username already taken', 'USERNAME_TAKEN');
+      console.error('[POST /api/auth/register] Error:', err.message);
+      errorResponse(res, 500, 'Registration failed', 'REGISTER_ERROR');
     }
   });
 
-  // -- leave:chat --
-  socket.on("leave:chat", (chatId) => {
-    const chatObjectId = toObjectId(chatId);
-    if (!chatObjectId) return;
-    socket.leave(toStr(chatObjectId));
-  });
-
-  // -- typing:start --
-  socket.on("typing:start", async ({ chatId }) => {
-    const chatObjectId = toObjectId(chatId);
-    if (!chatObjectId) return;
+  // POST /api/auth/login
+  app.post('/api/auth/login', async (req, res) => {
     try {
-      const chat = await db.collection("chats").findOne({ _id: chatObjectId }, { projection: { members: 1 } });
-      if (!chat || !Array.isArray(chat.members) || !chat.members.includes(userId)) return;
-      const roomId = toStr(chatObjectId);
-      socket.to(roomId).emit("typing:start", {
-        chatId: roomId,
-        userId,
-        username: socket.userData && socket.userData.username,
-        displayName: socket.userData && socket.userData.displayName,
-      });
-    } catch {
-      // noop
+      const { username, password } = req.body;
+
+      if (!username || !password) {
+        return errorResponse(res, 400, 'Username and password required', 'MISSING_CREDENTIALS');
+      }
+
+      const user = await db.collection('users').findOne({ usernameLower: username.toLowerCase() });
+      if (!user) return errorResponse(res, 401, 'Invalid credentials', 'INVALID_CREDENTIALS');
+
+      const match = await bcrypt.compare(password, user.passwordHash);
+      if (!match) return errorResponse(res, 401, 'Invalid credentials', 'INVALID_CREDENTIALS');
+
+      await db.collection('users').updateOne({ _id: user._id }, { $set: { lastSeenAt: new Date() } });
+      invalidateUserCache(String(user._id));
+
+      const token = await createSession(db, user._id);
+
+      successResponse(res, { token, user: normalizeUser(user) });
+    } catch (err) {
+      console.error('[POST /api/auth/login] Error:', err.message);
+      errorResponse(res, 500, 'Login failed', 'LOGIN_ERROR');
     }
   });
 
-  // -- typing:stop --
-  socket.on("typing:stop", async ({ chatId }) => {
-    const chatObjectId = toObjectId(chatId);
-    if (!chatObjectId) return;
+  // POST /api/auth/logout
+  app.post('/api/auth/logout', auth, async (req, res) => {
     try {
-      const chat = await db.collection("chats").findOne({ _id: chatObjectId }, { projection: { members: 1 } });
-      if (!chat || !Array.isArray(chat.members) || !chat.members.includes(userId)) return;
-      const roomId = toStr(chatObjectId);
-      socket.to(roomId).emit("typing:stop", {
-        chatId: roomId,
-        userId,
-      });
-    } catch {
-      // noop
+      const token = req.headers.authorization.split(' ')[1];
+      await db.collection('sessions').deleteOne({ token });
+      successResponse(res, { message: 'Logged out' });
+    } catch (err) {
+      console.error('[POST /api/auth/logout] Error:', err.message);
+      errorResponse(res, 500, 'Logout failed', 'LOGOUT_ERROR');
     }
   });
 
-  // -- message:send via socket (alternative to REST) --
-  socket.on("message:send", async (data, ack) => {
+  // GET /api/auth/me
+  app.get('/api/auth/me', auth, async (req, res) => {
+    successResponse(res, { user: req.user });
+  });
+
+  // POST /api/auth/guest
+  app.post('/api/auth/guest', async (req, res) => {
     try {
-      const { chatId, content, attachments, replyToId } = data;
-      if (!chatId || (!content && (!attachments || !attachments.length))) {
-        if (ack) ack({ error: "chatId and content required" });
-        return;
+      let inserted = null;
+      for (let attempt = 0; attempt < 5; attempt++) {
+        const candidate = 'guest_' + crypto.randomBytes(4).toString('hex');
+        try {
+          const doc = {
+            username: candidate,
+            usernameLower: candidate,
+            displayName: 'Guest ' + candidate.slice(6, 10).toUpperCase(),
+            passwordHash: null,
+            avatar: null,
+            isGuest: true,
+            isAdmin: false,
+            isOnline: false,
+            createdAt: new Date(),
+            lastSeenAt: new Date(),
+          };
+          const result = await db.collection('users').insertOne(doc);
+          inserted = { ...doc, _id: result.insertedId };
+          break;
+        } catch (err) {
+          if (err?.code !== 11000) throw err;
+        }
       }
+      if (!inserted) return errorResponse(res, 500, 'Could not create guest account', 'GUEST_CREATE_FAILED');
+      const token = await createSession(db, inserted._id);
+      successResponse(res, { token, user: normalizeUser(inserted) }, 201);
+    } catch (err) {
+      console.error('[POST /api/auth/guest] Error:', err.message);
+      errorResponse(res, 500, 'Failed to create guest session', 'GUEST_ERROR');
+    }
+  });
 
-      const chatObjectId = toObjectId(chatId);
-      if (!chatObjectId) {
-        if (ack) ack({ error: "Chat not found or not a member" });
-        return;
+  // POST /api/auth/forgot-password
+  app.post('/api/auth/forgot-password', async (req, res) => {
+    try {
+      const username = sanitizeText(req.body?.username || '', CONFIG.validation.maxUsernameLength);
+      const whatsapp = sanitizeText(req.body?.whatsapp || '', 32);
+      if (!isValidUsername(username)) return errorResponse(res, 400, 'Invalid username', 'INVALID_USERNAME');
+      if (!isValidWhatsapp(whatsapp)) return errorResponse(res, 400, 'Invalid WhatsApp number', 'INVALID_WHATSAPP');
+
+      const existing = await db.collection('forgotPasswordRequests').findOne(
+        { username, whatsapp, status: 'pending' },
+        { projection: { _id: 1 } }
+      );
+      if (existing) return errorResponse(res, 409, 'A pending request already exists', 'DUPLICATE_REQUEST');
+
+      const doc = { username, whatsapp, status: 'pending', createdAt: new Date() };
+      const result = await db.collection('forgotPasswordRequests').insertOne(doc);
+
+      successResponse(res, {
+        request: { id: String(result.insertedId), username: doc.username, whatsapp: doc.whatsapp, status: doc.status, createdAt: doc.createdAt.toISOString() },
+      }, 201);
+    } catch (err) {
+      console.error('[POST /api/auth/forgot-password] Error:', err.message);
+      errorResponse(res, 500, 'Failed to submit request', 'FORGOT_PASSWORD_ERROR');
+    }
+  });
+
+  // ==========================================================================
+  // SECTION 11b: HEALTH
+  // ==========================================================================
+
+  app.get('/api/health', (req, res) => {
+    successResponse(res, { status: 'ok', uptime: process.uptime(), online: onlineUsers.size });
+  });
+
+  // ==========================================================================
+  // SECTION 11c: USER ROUTES
+  // ==========================================================================
+
+  app.get('/api/users/search', auth, async (req, res) => {
+    try {
+      const rawQ = req.query?.q;
+      if (typeof rawQ !== 'string' || rawQ.trim().length < 1) {
+        return errorResponse(res, 400, 'Search query required', 'EMPTY_QUERY');
       }
-      const chat = await db.collection("chats").findOne({ _id: chatObjectId });
-      if (!chat || !chat.members.includes(userId)) {
-        if (ack) ack({ error: "Chat not found or not a member" });
-        return;
-      }
+      const sanitizedQuery = sanitizeText(rawQ, 100);
+      if (!sanitizedQuery) return successResponse(res, { users: [] });
 
-      const roomId = toStr(chatObjectId);
+      console.log(`[GET /api/users/search] query="${sanitizedQuery}" user="${req.userId}"`);
 
-      const messageContent = (content || "").trim();
-      const { mentionedUserIds, hasEveryone, hasHere } = await parseMentions(messageContent, chat.members);
+      const escaped = sanitizedQuery.toLowerCase().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const regex = new RegExp(escaped, 'i');
 
-      const now = new Date();
-      const message = {
-        chatId: roomId,
-        senderId: userId,
-        content: messageContent,
-        attachments: Array.isArray(attachments) ? attachments : [],
-        reactions: {},
-        mentionedUserIds,
-        hasEveryone,
-        hasHere,
-        replyToId: replyToId || null,
-        createdAt: now,
-        editedAt: null,
-        deletedAt: null,
+      const selfId = req.userId;
+      const selfOid = isValidObjectId(selfId) ? toObjectId(selfId) : null;
+
+      const filter = {
+        $or: [{ usernameLower: regex }, { username: regex }, { displayName: regex }],
+        isGuest: { $ne: true },
       };
 
-      const result = await db.collection("messages").insertOne(message);
-      const saved = { ...message, id: toStr(result.insertedId), _id: undefined };
+      if (selfOid) {
+        filter._id = { $ne: selfOid };
+      }
 
-      await db.collection("chats").updateOne(
-        { _id: chat._id },
-        { $set: { updatedAt: now, lastMessage: { content: messageContent, senderId: userId, createdAt: now } } }
+      const users = await db
+        .collection('users')
+        .find(filter, {
+          projection: { username: 1, displayName: 1, avatar: 1, lastSeenAt: 1, isAdmin: 1, isGuest: 1 },
+        })
+        .limit(20)
+        .toArray();
+
+      const normalized = users.map((u) => {
+        const n = normalizeUser(u);
+        const onlineEntry = onlineUsers.get(n.id);
+        if (onlineEntry) {
+          n.isOnline = onlineEntry.isOnline;
+          n.lastSeenAt = onlineEntry.lastSeenAt?.toISOString?.() || n.lastSeenAt;
+        }
+        return n;
+      });
+
+      successResponse(res, { users: normalized });
+    } catch (err) {
+      console.error('[GET /api/users/search] Error:', err.message);
+      errorResponse(res, 500, 'Search failed', 'SEARCH_ERROR');
+    }
+  });
+
+  app.get('/api/users/:userId', auth, async (req, res) => {
+    try {
+      const userId = req.params.userId;
+      if (!isValidObjectId(userId)) return errorResponse(res, 400, 'Invalid userId', 'INVALID_USER_ID');
+      const user = await getCachedUser(db, userId);
+      if (!user) return errorResponse(res, 404, 'User not found', 'USER_NOT_FOUND');
+      const onlineEntry = onlineUsers.get(userId);
+      if (onlineEntry) {
+        user.isOnline = onlineEntry.isOnline;
+        user.lastSeenAt = onlineEntry.lastSeenAt?.toISOString() || user.lastSeenAt;
+      }
+      successResponse(res, { user });
+    } catch (err) {
+      console.error('[GET /api/users] Error:', err.message);
+      errorResponse(res, 500, 'Failed to fetch user', 'FETCH_USER_ERROR');
+    }
+  });
+
+  // ==========================================================================
+  // SECTION 11d: CHAT ROUTES
+  // ==========================================================================
+
+  app.get('/api/chats', auth, async (req, res) => {
+    try {
+      const chats = await db
+        .collection('chats')
+        .find({ participants: req.userId }, { projection: { type: 1, name: 1, participants: 1, lastMessage: 1, createdAt: 1, updatedAt: 1 } })
+        .sort({ updatedAt: -1 })
+        .toArray();
+
+      const allParticipantIds = [...new Set(chats.flatMap((c) => c.participants || []))];
+      const usersMap = await batchGetUsers(db, allParticipantIds);
+
+      const normalized = chats.map((chat) => {
+        const c = normalizeChat(chat);
+        c.participants = (chat.participants || []).map((pid) => usersMap.get(String(pid)) || { id: String(pid) });
+        return c;
+      });
+
+      successResponse(res, { chats: normalized });
+    } catch (err) {
+      console.error('[GET /api/chats] Error:', err.message);
+      errorResponse(res, 500, 'Failed to fetch chats', 'FETCH_CHATS_ERROR');
+    }
+  });
+
+  app.post('/api/chats', auth, async (req, res) => {
+    try {
+      const { type, participantIds, name } = req.body;
+      if (!Array.isArray(participantIds) || participantIds.length === 0) {
+        return errorResponse(res, 400, 'participantIds required', 'INVALID_PARTICIPANTS');
+      }
+      const validIds = participantIds.filter(isValidObjectId);
+      if (validIds.length !== participantIds.length) {
+        return errorResponse(res, 400, 'Invalid participant ID(s)', 'INVALID_PARTICIPANT_ID');
+      }
+      const allParticipants = [...new Set([req.userId, ...validIds])];
+
+      if (type === 'direct' && allParticipants.length === 2) {
+        const existing = await db.collection('chats').findOne({ type: 'direct', participants: { $all: allParticipants, $size: 2 } });
+        if (existing) return successResponse(res, { chat: normalizeChat(existing) });
+      }
+
+      const now = new Date().toISOString();
+      const chatDoc = {
+        type: type || 'direct',
+        name: name ? sanitizeText(name, CONFIG.validation.maxUsernameLength) : null,
+        participants: allParticipants,
+        lastMessage: null,
+        createdAt: now,
+        updatedAt: now,
+      };
+      const result = await db.collection('chats').insertOne(chatDoc);
+      chatDoc._id = result.insertedId;
+      successResponse(res, { chat: normalizeChat(chatDoc) }, 201);
+    } catch (err) {
+      console.error('[POST /api/chats] Error:', err.message);
+      errorResponse(res, 500, 'Failed to create chat', 'CREATE_CHAT_ERROR');
+    }
+  });
+
+  // ==========================================================================
+  // SECTION 11e: MESSAGE ROUTES
+  // ==========================================================================
+
+  app.get('/api/messages/:chatId', auth, async (req, res) => {
+    try {
+      const chatId = ensureChatIdString(req.params.chatId);
+      if (!chatId) return errorResponse(res, 400, 'Invalid chatId', 'INVALID_CHAT_ID');
+
+      const chat = await db.collection('chats').findOne({ _id: toObjectId(chatId), participants: req.userId }, { projection: { _id: 1 } });
+      if (!chat) return errorResponse(res, 403, 'Not a participant of this chat', 'NOT_PARTICIPANT');
+
+      const { cursor, direction = 'before', limit: rawLimit } = req.query;
+      const limit = Math.min(Math.max(parseInt(rawLimit, 10) || CONFIG.pagination.defaultLimit, 1), CONFIG.pagination.maxLimit);
+      const query = { chatId };
+
+      if (cursor) {
+        let cursorDate;
+        if (isValidObjectId(cursor)) {
+          const cursorMsg = await db.collection('messages').findOne({ _id: toObjectId(cursor) }, { projection: { createdAt: 1 } });
+          cursorDate = cursorMsg?.createdAt;
+        } else {
+          const parsed = new Date(cursor);
+          if (!isNaN(parsed.getTime())) cursorDate = parsed.toISOString();
+        }
+        if (cursorDate) query.createdAt = direction === 'after' ? { $gt: cursorDate } : { $lt: cursorDate };
+      }
+
+      const sortDir = direction === 'after' ? 1 : -1;
+      const messages = await db.collection('messages').find(query).sort({ createdAt: sortDir }).limit(limit + 1).toArray();
+      if (messages.length > limit) messages.pop();
+      if (direction !== 'after') messages.reverse();
+
+      // Mark fetched messages as DELIVERED if recipient is current user
+      const unDelivered = messages.filter(m => m.senderId !== req.userId && m.status === 'sent');
+      if (unDelivered.length > 0) {
+        const uids = unDelivered.map(m => m._id);
+        await db.collection('messages').updateMany({ _id: { $in: uids } }, { $set: { status: 'delivered', updatedAt: new Date().toISOString() } });
+        messages.forEach(m => { if (uids.some(uid => String(uid) === String(m._id))) m.status = 'delivered'; });
+        
+        // Notify senders
+        unDelivered.forEach(m => {
+          safeEmit(io, `user:${m.senderId}`, 'message:status', buildSocketEvent('message:status', { messageId: String(m._id), status: 'delivered', chatId }, { chatId }));
+        });
+      }
+
+      const senderIds = [...new Set(messages.map((m) => m.senderId).filter(Boolean))];
+      const sendersMap = await batchGetUsers(db, senderIds);
+      const normalized = messages.map((msg) => {
+        const n = normalizeMessage(msg);
+        n.sender = sendersMap.get(msg.senderId) || null;
+        return n;
+      });
+
+      const nextCursor = hasMore && normalized.length > 0
+        ? (direction === 'after' ? normalized[normalized.length - 1].id : normalized[0].id)
+        : null;
+
+      successResponse(res, { messages: normalized, nextCursor, hasMore });
+    } catch (err) {
+      console.error('[GET /api/messages] Error:', err.message);
+      errorResponse(res, 500, 'Failed to fetch messages', 'FETCH_MESSAGES_ERROR');
+    }
+  });
+
+  app.post('/api/messages/:chatId', auth, async (req, res) => {
+    try {
+      const chatId = ensureChatIdString(req.params.chatId);
+      if (!chatId) return errorResponse(res, 400, 'Invalid chatId', 'INVALID_CHAT_ID');
+
+      const chat = await db.collection('chats').findOne({ _id: toObjectId(chatId), participants: req.userId }, { projection: { _id: 1, participants: 1 } });
+      if (!chat) return errorResponse(res, 403, 'Not a participant of this chat', 'NOT_PARTICIPANT');
+
+      const { content, type, attachments, replyTo, mentions, clientMessageId } = req.body;
+      const sanitizedContent = sanitizeText(content || '');
+      const validAttachments = validateAttachments(attachments);
+      if (!sanitizedContent && validAttachments.length === 0) return errorResponse(res, 400, 'Message must have content or attachments', 'EMPTY_MESSAGE');
+
+      if (clientMessageId && typeof clientMessageId === 'string') {
+        const existing = await db.collection('messages').findOne({ clientMessageId }, { projection: { _id: 1, chatId: 1, senderId: 1, content: 1, createdAt: 1 } });
+        if (existing) {
+          const sender = await getCachedUser(db, req.userId);
+          const n = normalizeMessage(existing);
+          n.sender = sender;
+          return successResponse(res, { message: n, deduplicated: true });
+        }
+      }
+
+      if (replyTo) {
+        if (!isValidObjectId(replyTo)) return errorResponse(res, 400, 'Invalid replyTo ID', 'INVALID_REPLY_TO');
+        const replyMsg = await db.collection('messages').findOne({ _id: toObjectId(replyTo), chatId, isDeleted: { $ne: true } }, { projection: { _id: 1 } });
+        if (!replyMsg) return errorResponse(res, 400, 'Reply target not found or deleted', 'REPLY_NOT_FOUND');
+      }
+
+      let resolvedMentions = [];
+      if (Array.isArray(mentions) && mentions.length > 0) {
+        const mentionIds = mentions.filter(isValidObjectId);
+        const mentionUsers = await batchGetUsers(db, mentionIds);
+        resolvedMentions = mentionIds.filter((id) => mentionUsers.has(id));
+      }
+
+      const now = new Date().toISOString();
+      const messageDoc = {
+        chatId, senderId: req.userId, content: sanitizedContent, type: type || 'text',
+        attachments: validAttachments, reactions: {}, mentions: resolvedMentions,
+        replyTo: replyTo || null, isEdited: false, isDeleted: false,
+        clientMessageId: clientMessageId || null, status: 'sent',
+        createdAt: now, updatedAt: now,
+      };
+
+      const result = await db.collection('messages').insertOne(messageDoc);
+      messageDoc._id = result.insertedId;
+
+      await db.collection('chats').updateOne(
+        { _id: toObjectId(chatId) },
+        { $set: { lastMessage: { _id: result.insertedId, content: sanitizedContent, senderId: req.userId, createdAt: now }, updatedAt: now } }
       );
 
-      io.to(roomId).emit("message:new", saved);
+      const sender = await getCachedUser(db, req.userId);
+      const normalized = normalizeMessage(messageDoc);
+      normalized.sender = sender;
 
-      for (const uid of mentionedUserIds) {
-        const sid = getOnlineSocketId(uid);
-        if (sid) io.to(sid).emit("mention:received", { chatId, messageId: toStr(result.insertedId) });
-      }
-
-      if (ack) ack({ success: true, message: saved });
+      safeEmit(io, `chat:${chatId}`, 'message:new', buildSocketEvent('message:new', { message: normalized }, { chatId, userId: req.userId }));
+      successResponse(res, { message: normalized }, 201);
     } catch (err) {
-      console.error("[socket message:send]", err);
-      if (ack) ack({ error: "Failed to send message" });
+      if (err.code === 11000 && err.keyPattern?.clientMessageId) {
+        const existing = await db.collection('messages').findOne({ clientMessageId: req.body.clientMessageId });
+        if (existing) {
+          const sender = await getCachedUser(db, req.userId);
+          const n = normalizeMessage(existing);
+          n.sender = sender;
+          return successResponse(res, { message: n, deduplicated: true });
+        }
+      }
+      console.error('[POST /api/messages] Error:', err.message);
+      errorResponse(res, 500, 'Failed to send message', 'SEND_MESSAGE_ERROR');
     }
   });
 
-  // -- message:react via socket --
-  socket.on("message:react", async (data, ack) => {
+  app.post('/api/messages/:chatId/read', auth, async (req, res) => {
     try {
-      const { messageId, emoji } = data;
-      if (!messageId || !emoji) {
-        if (ack) ack({ error: "messageId and emoji required" });
-        return;
-      }
+      const chatId = ensureChatIdString(req.params.chatId);
+      if (!chatId) return errorResponse(res, 400, 'Invalid chatId', 'INVALID_CHAT_ID');
 
-      const messageObjectId = toObjectId(messageId);
-      if (!messageObjectId) {
-        if (ack) ack({ error: "Message not found" });
-        return;
-      }
-      const msg = await db.collection("messages").findOne({ _id: messageObjectId });
-      if (!msg || msg.deletedAt) {
-        if (ack) ack({ error: "Message not found" });
-        return;
-      }
+      const chat = await db.collection('chats').findOne({ _id: toObjectId(chatId), participants: req.userId }, { projection: { _id: 1, participants: 1 } });
+      if (!chat) return errorResponse(res, 403, 'Not a participant of this chat', 'NOT_PARTICIPANT');
 
-      const reactions = msg.reactions || {};
-      let existingEmoji = null;
-      for (const [e, d] of Object.entries(reactions)) {
-        if (d.users && d.users.includes(userId)) {
-          existingEmoji = e;
-          break;
+      const now = new Date().toISOString();
+      const result = await db.collection('messages').updateMany(
+        { chatId, senderId: { $ne: req.userId }, status: { $ne: 'seen' } },
+        { $set: { status: 'seen', updatedAt: now } }
+      );
+
+      if (result.modifiedCount > 0) {
+        const otherParticipant = chat.participants.find(p => String(p) !== req.userId);
+        if (otherParticipant) {
+          safeEmit(io, `user:${otherParticipant}`, 'message:status', buildSocketEvent('message:status', { status: 'seen', chatId }, { chatId }));
         }
       }
 
-      if (existingEmoji === emoji) {
-        reactions[emoji].users = reactions[emoji].users.filter((u) => u !== userId);
-        if (reactions[emoji].users.length === 0) delete reactions[emoji];
+      successResponse(res, { modifiedCount: result.modifiedCount });
+    } catch (err) {
+      console.error('[POST /api/messages/read] Error:', err.message);
+      errorResponse(res, 500, 'Failed to mark messages as read', 'MARK_READ_ERROR');
+    }
+  });
+
+  app.put('/api/messages/:messageId', auth, async (req, res) => {
+    try {
+      const messageId = req.params.messageId;
+      if (!isValidObjectId(messageId)) return errorResponse(res, 400, 'Invalid messageId', 'INVALID_MESSAGE_ID');
+
+      const message = await db.collection('messages').findOne({ _id: toObjectId(messageId) }, { projection: { senderId: 1, chatId: 1, isDeleted: 1 } });
+      if (!message) return errorResponse(res, 404, 'Message not found', 'MESSAGE_NOT_FOUND');
+      if (message.isDeleted) return errorResponse(res, 400, 'Cannot edit a deleted message', 'MESSAGE_DELETED');
+      if (message.senderId !== req.userId) return errorResponse(res, 403, "Cannot edit another user's message", 'NOT_MESSAGE_OWNER');
+
+      const sanitizedContent = sanitizeText(req.body?.content || '');
+      if (!sanitizedContent) return errorResponse(res, 400, 'Content cannot be empty', 'EMPTY_CONTENT');
+
+      const now = new Date().toISOString();
+      await db.collection('messages').updateOne({ _id: toObjectId(messageId) }, { $set: { content: sanitizedContent, isEdited: true, updatedAt: now } });
+
+      const updated = await db.collection('messages').findOne({ _id: toObjectId(messageId) });
+      const normalized = normalizeMessage(updated);
+      normalized.sender = await getCachedUser(db, req.userId);
+
+      const chatId = ensureChatIdString(message.chatId);
+      safeEmit(io, `chat:${chatId}`, 'message:update', buildSocketEvent('message:update', { message: normalized }, { chatId, userId: req.userId }));
+      successResponse(res, { message: normalized });
+    } catch (err) {
+      console.error('[PUT /api/messages] Error:', err.message);
+      errorResponse(res, 500, 'Failed to edit message', 'EDIT_MESSAGE_ERROR');
+    }
+  });
+
+  app.delete('/api/messages/:messageId', auth, async (req, res) => {
+    try {
+      const messageId = req.params.messageId;
+      if (!isValidObjectId(messageId)) return errorResponse(res, 400, 'Invalid messageId', 'INVALID_MESSAGE_ID');
+
+      const message = await db.collection('messages').findOne({ _id: toObjectId(messageId) }, { projection: { senderId: 1, chatId: 1, isDeleted: 1 } });
+      if (!message) return errorResponse(res, 404, 'Message not found', 'MESSAGE_NOT_FOUND');
+      if (message.isDeleted) return errorResponse(res, 400, 'Message already deleted', 'ALREADY_DELETED');
+      if (message.senderId !== req.userId) return errorResponse(res, 403, "Cannot delete another user's message", 'NOT_MESSAGE_OWNER');
+
+      const now = new Date().toISOString();
+      await db.collection('messages').updateOne({ _id: toObjectId(messageId) }, { $set: { isDeleted: true, content: '', attachments: [], updatedAt: now } });
+
+      const chatId = ensureChatIdString(message.chatId);
+      safeEmit(io, `chat:${chatId}`, 'message:delete', buildSocketEvent('message:delete', { messageId }, { chatId, userId: req.userId }));
+      successResponse(res, { messageId });
+    } catch (err) {
+      console.error('[DELETE /api/messages] Error:', err.message);
+      errorResponse(res, 500, 'Failed to delete message', 'DELETE_MESSAGE_ERROR');
+    }
+  });
+
+  app.post('/api/messages/:messageId/reactions', auth, async (req, res) => {
+    try {
+      const messageId = req.params.messageId;
+      if (!isValidObjectId(messageId)) return errorResponse(res, 400, 'Invalid messageId', 'INVALID_MESSAGE_ID');
+
+      const { reaction } = req.body;
+      if (!isValidReaction(reaction)) return errorResponse(res, 400, 'Invalid reaction', 'INVALID_REACTION');
+
+      const message = await db.collection('messages').findOne({ _id: toObjectId(messageId) }, { projection: { chatId: 1, reactions: 1, isDeleted: 1 } });
+      if (!message) return errorResponse(res, 404, 'Message not found', 'MESSAGE_NOT_FOUND');
+      if (message.isDeleted) return errorResponse(res, 400, 'Cannot react to a deleted message', 'MESSAGE_DELETED');
+
+      const trimmedReaction = reaction.trim();
+      const reactions = message.reactions || {};
+      const usersForReaction = reactions[trimmedReaction] || [];
+
+      let updatedUsers;
+      if (usersForReaction.includes(req.userId)) {
+        updatedUsers = usersForReaction.filter((id) => id !== req.userId);
       } else {
-        if (existingEmoji) {
-          reactions[existingEmoji].users = reactions[existingEmoji].users.filter((u) => u !== userId);
-          if (reactions[existingEmoji].users.length === 0) delete reactions[existingEmoji];
-        }
-        if (!reactions[emoji]) reactions[emoji] = { users: [] };
-        reactions[emoji].users.push(userId);
+        updatedUsers = [...usersForReaction, req.userId];
       }
 
-      await db.collection("messages").updateOne({ _id: msg._id }, { $set: { reactions } });
-      io.to(msg.chatId).emit("reaction:update", { messageId, chatId: msg.chatId, reactions });
-      if (ack) ack({ success: true, reactions });
+      if (updatedUsers.length === 0) {
+        delete reactions[trimmedReaction];
+        await db.collection('messages').updateOne({ _id: toObjectId(messageId) }, { $unset: { [`reactions.${trimmedReaction}`]: '' } });
+      } else {
+        reactions[trimmedReaction] = updatedUsers;
+        await db.collection('messages').updateOne({ _id: toObjectId(messageId) }, { $set: { [`reactions.${trimmedReaction}`]: updatedUsers } });
+      }
+
+      const chatId = ensureChatIdString(message.chatId);
+      safeEmit(io, `chat:${chatId}`, 'reaction:update', buildSocketEvent('reaction:update', { messageId, reactions }, { chatId, userId: req.userId }));
+      successResponse(res, { messageId, reactions });
     } catch (err) {
-      console.error("[socket react]", err);
-      if (ack) ack({ error: "Failed to react" });
+      console.error('[POST /api/reactions] Error:', err.message);
+      errorResponse(res, 500, 'Failed to update reaction', 'REACTION_ERROR');
     }
   });
 
-  // -- disconnect --
-  socket.on("disconnect", async (reason) => {
-    const dname = socket.userData && socket.userData.username;
-    console.log(`[Socket] Disconnected: ${dname || userId} (socket ${socket.id}) reason=%s`, reason);
-    removeOnlineSocket(userId, socket.id);
+  // ==========================================================================
+  // SECTION 11f: ADMIN ROUTES
+  // ==========================================================================
+
+  app.get('/api/admin/forgot-password-requests', auth, requireAdmin, async (req, res) => {
+    try {
+      const status = req.query?.status;
+      const filter = {};
+      if (status === 'pending' || status === 'resolved') filter.status = status;
+      const limit = Math.min(parseInt(req.query?.limit, 10) || CONFIG.pagination.defaultLimit, CONFIG.pagination.maxLimit);
+      const docs = await db.collection('forgotPasswordRequests').find(filter).sort({ createdAt: -1 }).limit(limit).toArray();
+      const requests = docs.map((d) => ({ id: String(d._id), username: d.username, whatsapp: d.whatsapp, status: d.status, createdAt: d.createdAt instanceof Date ? d.createdAt.toISOString() : d.createdAt, resolvedAt: d.resolvedAt instanceof Date ? d.resolvedAt.toISOString() : d.resolvedAt || null, resolvedBy: d.resolvedBy || null }));
+      successResponse(res, { requests, total: requests.length });
+    } catch (err) {
+      console.error('[GET /api/admin/forgot-password-requests] Error:', err.message);
+      errorResponse(res, 500, 'Failed to fetch requests', 'ADMIN_FETCH_ERROR');
+    }
+  });
+
+  app.patch('/api/admin/forgot-password-requests/:id', auth, requireAdmin, async (req, res) => {
+    try {
+      const { id } = req.params;
+      if (!isValidObjectId(id)) return errorResponse(res, 400, 'Invalid request id', 'INVALID_ID');
+      const result = await db.collection('forgotPasswordRequests').findOneAndUpdate(
+        { _id: toObjectId(id) },
+        { $set: { status: 'resolved', resolvedAt: new Date(), resolvedBy: req.user.id } },
+        { returnDocument: 'after' }
+      );
+      const doc = result?.value || result;
+      if (!doc || !doc._id) return errorResponse(res, 404, 'Request not found', 'NOT_FOUND');
+      successResponse(res, { request: { id: String(doc._id), username: doc.username, whatsapp: doc.whatsapp, status: doc.status, createdAt: doc.createdAt instanceof Date ? doc.createdAt.toISOString() : doc.createdAt, resolvedAt: doc.resolvedAt instanceof Date ? doc.resolvedAt.toISOString() : doc.resolvedAt, resolvedBy: doc.resolvedBy || null } });
+    } catch (err) {
+      console.error('[PATCH /api/admin/forgot-password-requests/:id] Error:', err.message);
+      errorResponse(res, 500, 'Failed to update request', 'ADMIN_UPDATE_ERROR');
+    }
+  });
+
+  app.get('/api/admin/users', auth, requireAdmin, async (req, res) => {
+    try {
+      const filter = {};
+      const q = sanitizeText(req.query?.q || '', 100);
+      if (q) {
+        const escaped = q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        filter.$or = [{ username: new RegExp(escaped, 'i') }, { displayName: new RegExp(escaped, 'i') }];
+      }
+      if (req.query?.role === 'admin') filter.isAdmin = true;
+      else if (req.query?.role === 'guest') filter.isGuest = true;
+      else if (req.query?.role === 'user') { filter.isAdmin = { $ne: true }; filter.isGuest = { $ne: true }; }
+      const limit = Math.min(parseInt(req.query?.limit, 10) || CONFIG.pagination.defaultLimit, CONFIG.pagination.maxLimit);
+      const skip = Math.max(parseInt(req.query?.skip, 10) || 0, 0);
+      const users = await db.collection('users').find(filter).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray();
+      successResponse(res, { users: users.map(normalizeUser), total: users.length });
+    } catch (err) {
+      console.error('[GET /api/admin/users] Error:', err.message);
+      errorResponse(res, 500, 'Failed to fetch users', 'ADMIN_FETCH_ERROR');
+    }
+  });
+
+  app.patch('/api/admin/users/:id/role', auth, requireAdmin, async (req, res) => {
+    try {
+      const { id } = req.params;
+      if (!isValidObjectId(id)) return errorResponse(res, 400, 'Invalid user id', 'INVALID_ID');
+      const update = {};
+      if (typeof req.body?.isAdmin === 'boolean') update.isAdmin = req.body.isAdmin;
+      if (Object.keys(update).length === 0) return errorResponse(res, 400, 'No valid fields to update', 'NO_FIELDS');
+      const result = await db.collection('users').updateOne({ _id: toObjectId(id) }, { $set: update });
+      if (result.matchedCount === 0) return errorResponse(res, 404, 'User not found', 'USER_NOT_FOUND');
+      invalidateUserCache(id);
+      successResponse(res, { updated: true, fields: update });
+    } catch (err) {
+      console.error('[PATCH /api/admin/users/:id/role] Error:', err.message);
+      errorResponse(res, 500, 'Failed to update role', 'ADMIN_UPDATE_ERROR');
+    }
+  });
+
+  // ==========================================================================
+  // SECTION 12: SOCKET.IO
+  // ==========================================================================
+
+  io.use(async (socket, next) => {
+    try {
+      const token = socket.handshake.auth?.token;
+      if (!token) return next(new Error('AUTH_REQUIRED'));
+      const session = await db.collection('sessions').findOne({ token }, { projection: { userId: 1 } });
+      if (!session) return next(new Error('SESSION_EXPIRED'));
+      const user = await getCachedUser(db, String(session.userId));
+      if (!user) return next(new Error('USER_NOT_FOUND'));
+      socket.userId = user.id;
+      socket.username = user.username || user.displayName;
+      next();
+    } catch (err) {
+      console.error('[Socket Auth] Error:', err.message);
+      next(new Error('AUTH_ERROR'));
+    }
+  });
+
+  io.on('connection', async (socket) => {
+    const { userId, username } = socket;
+    console.log(`[Socket] Connected: ${username} (${userId}) — ${socket.id}`);
+
+    socket.join(`user:${userId}`);
 
     try {
-      const socketUserId = toObjectId(userId);
-      if (socketUserId) {
-        await db.collection("users").updateOne({ _id: socketUserId }, { $set: { lastSeenAt: new Date() } });
+      const chats = await db.collection('chats').find({ participants: userId }, { projection: { _id: 1, participants: 1 } }).toArray();
+      for (const chat of chats) {
+        socket.join(`chat:${ensureChatIdString(chat._id)}`);
       }
-    } catch (e) {
-      console.error("[Socket] disconnect lastSeen update failed", e);
+      const friendIds = [...new Set(chats.flatMap((c) => c.participants).filter((id) => id !== userId))];
+      for (const fid of friendIds) socket.join(`user:${fid}:friends`);
+    } catch (err) {
+      console.error('[Socket] Room join error:', err.message);
     }
 
-    try {
-      await broadcastOnlineStatus(socket, userId, false);
-    } catch (e) {
-      console.error("[Socket] disconnect broadcast failed", e);
-    }
-  });
-});
+    setUserOnline(io, db, userId, socket.id);
 
-// Helper: broadcast online/offline to mutual friends
-async function broadcastOnlineStatus(socket, userId, isOnline) {
-  try {
-    const docs = await db
-      .collection("friends")
-      .find({
-        $or: [{ userA: userId }, { userB: userId }],
-        status: "friends",
-      })
-      .toArray();
-
-    for (const d of docs) {
-      const friendId = d.userA === userId ? d.userB : d.userA;
-      const friendSid = getOnlineSocketId(friendId);
-      if (friendSid) {
-        io.to(friendSid).emit(isOnline ? "user:online" : "user:offline", { userId });
-      }
-    }
-  } catch (_) {
-    // silent
-  }
-}
-
-// ===============================================================
-//  HEALTH CHECK
-// ===============================================================
-
-app.get("/health", (req, res) => {
-  res.json({
-    ok: true,
-    status: "ok",
-    service: "ChatFlow API",
-    uptime: process.uptime().toFixed(2) + "s",
-    timestamp: new Date().toISOString(),
-    online: onlineUsers.size,
-  });
-});
-
-app.get("/", (req, res) => {
-  res.json({
-    name: "ChatFlow API",
-    version: "1.0.0",
-    routes: {
-      auth: ["POST /auth/register", "POST /auth/login", "GET /auth/me", "PATCH /auth/me"],
-      users: ["GET /users/search?q=", "GET /users/:id"],
-      chats: [
-        "POST /chats/create",
-        "GET /chats",
-        "GET /chats/:id",
-        "PATCH /chats/:id",
-        "POST /chats/:id/members",
-        "DELETE /chats/:id/members/:userId",
-      ],
-      messages: ["POST /messages/send", "GET /messages/:chatId", "PATCH /messages/:id", "DELETE /messages/:id"],
-      reactions: ["POST /messages/react"],
-      friends: [
-        "POST /friends/request",
-        "POST /friends/accept",
-        "POST /friends/reject",
-        "POST /friends/block",
-        "POST /friends/unblock",
-        "GET /friends",
-        "GET /friends/requests",
-        "GET /friends/status/:userId",
-      ],
-    },
-  });
-});
-
-// 404 fallback
-app.use((req, res) => {
-  res.status(404).json({ success: false, message: `Route ${req.method} ${req.path} not found` });
-});
-
-// Global error handler
-app.use((err, req, res, next) => {
-  console.error("[Unhandled Error]", err);
-  res.status(500).json({ success: false, message: "Internal server error" });
-});
-
-// ===============================================================
-//  START SERVER
-// ===============================================================
-
-async function start() {
-  try {
-    await connectDB();
-    server.listen(PORT, () => {
-      console.log(`
-+-----------------------------------------------------+
-|           ChatFlow API is Running                   |
-+-----------------------------------------------------+
-|  HTTP  ->  http://localhost:${PORT}                    |
-|  WS    ->  ws://localhost:${PORT}                      |
-|  DB    ->  ${DB_NAME.padEnd(39)}|
-|  CORS  ->  ${CLIENT_URL.padEnd(39)}|
-+-----------------------------------------------------+
-      `);
+    socket.on('join-chat', (data) => {
+      try {
+        const chatId = ensureChatIdString(data?.chatId);
+        if (chatId) socket.join(`chat:${chatId}`);
+      } catch {}
     });
-  } catch (err) {
-    console.error("[FATAL] Failed to start server:", err);
-    process.exit(1);
-  }
+
+    socket.on('leave-chat', (data) => {
+      try {
+        const chatId = ensureChatIdString(data?.chatId);
+        if (chatId) socket.leave(`chat:${chatId}`);
+      } catch {}
+    });
+
+    socket.on('typing:start', (data) => {
+      try {
+        const chatId = ensureChatIdString(data?.chatId);
+        if (chatId) handleTypingStart(io, chatId, userId, username);
+      } catch {}
+    });
+
+    socket.on('typing:stop', (data) => {
+      try {
+        const chatId = ensureChatIdString(data?.chatId);
+        if (chatId) handleTypingStop(io, chatId, userId, username);
+      } catch {}
+    });
+
+    socket.on('message:read', async (data) => {
+      try {
+        const chatId = ensureChatIdString(data?.chatId);
+        if (!chatId) return;
+        await db.collection('chatReads').updateOne({ chatId, userId }, { $set: { lastReadAt: new Date().toISOString() } }, { upsert: true });
+      } catch {}
+    });
+
+    socket.on('rejoin', async () => {
+      try {
+        const chats = await db.collection('chats').find({ participants: userId }, { projection: { _id: 1 } }).toArray();
+        for (const chat of chats) socket.join(`chat:${ensureChatIdString(chat._id)}`);
+        socket.join(`user:${userId}`);
+      } catch {}
+    });
+
+    socket.on('disconnect', (reason) => {
+      console.log(`[Socket] Disconnected: ${username} (${userId}) — ${reason}`);
+      setUserOffline(io, db, userId, socket.id);
+      for (const [key] of typingState) {
+        if (key.endsWith(`:${userId}`)) {
+          const [chatId] = key.split(':');
+          handleTypingStop(io, chatId, userId, username);
+        }
+      }
+    });
+  });
+
+  // ==========================================================================
+  // SECTION 13: ERROR HANDLERS
+  // ==========================================================================
+
+  app.use((err, req, res, _next) => {
+    console.error('[Global Error]', err.message);
+    errorResponse(res, 500, 'Internal server error', 'INTERNAL_ERROR');
+  });
+
+  app.use((req, res) => {
+    errorResponse(res, 404, 'Route not found', 'NOT_FOUND');
+  });
+
+  // ==========================================================================
+  // SECTION 14: SERVER START
+  // ==========================================================================
+
+  httpServer.listen(CONFIG.port, () => {
+    console.log(`
++-----------------------------------------------------+
+|           ChatFlow API v2 is Running                |
++-----------------------------------------------------+
+|  HTTP  ->  http://localhost:${CONFIG.port}                  |
+|  WS    ->  ws://localhost:${CONFIG.port}                    |
+|  DB    ->  ${CONFIG.dbName.padEnd(39)}|
+|  CORS  ->  ${CONFIG.cors.origin.padEnd(39)}|
++-----------------------------------------------------+
+    `);
+  });
+
+  const shutdown = async () => {
+    console.log('[ChatFlow] Shutting down...');
+    io.close();
+    await mongoClient.close();
+    process.exit(0);
+  };
+  process.on('SIGTERM', shutdown);
+  process.on('SIGINT', shutdown);
 }
 
-start();
+startServer().catch((err) => {
+  console.error('[ChatFlow] Failed to start:', err);
+  process.exit(1);
+});
