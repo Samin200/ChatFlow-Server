@@ -23,8 +23,28 @@ const { Server } = require('socket.io');
 const { MongoClient, ObjectId } = require('mongodb');
 const crypto = require('crypto');
 const bcrypt = require('bcrypt');
+const multer = require('multer');
+const cloudinary = require('cloudinary').v2;
+const streamifier = require('streamifier');
 
 const SALT_ROUNDS = 10;
+
+// Configure Cloudinary from env
+if (process.env.CLOUDINARY_URL) {
+  // CLOUDINARY_URL auto-configures cloudinary
+} else if (process.env.CLOUDINARY_CLOUD_NAME) {
+  cloudinary.config({
+    cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+    api_key: process.env.CLOUDINARY_API_KEY,
+    api_secret: process.env.CLOUDINARY_API_SECRET,
+  });
+}
+
+// Multer: store files in memory (we stream to Cloudinary)
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 25 * 1024 * 1024 }, // 25 MB
+});
 
 // ============================================================================
 // SECTION 1: CONFIGURATION
@@ -745,6 +765,7 @@ async function startServer() {
 
       const normalized = chats.map((chat) => {
         const c = normalizeChat(chat);
+        c.unreadCount = chat.unreadCounts?.[req.userId] || 0;
         // Only keep summary info for sidebar
         c.participants = (chat.participants || []).map((pid) => {
             const u = usersMap.get(String(pid));
@@ -777,12 +798,16 @@ async function startServer() {
         if (existing) return successResponse(res, { chat: normalizeChat(existing) });
       }
 
+      const unreadCounts = {};
+      allParticipants.forEach(p => { unreadCounts[p] = 0; });
+
       const now = new Date().toISOString();
       const chatDoc = {
         type: type || 'direct',
         name: name ? sanitizeText(name, CONFIG.validation.maxUsernameLength) : null,
         participants: allParticipants,
         lastMessage: null,
+        unreadCounts,
         createdAt: now,
         updatedAt: now,
       };
@@ -916,9 +941,17 @@ async function startServer() {
       const result = await db.collection('messages').insertOne(messageDoc);
       messageDoc._id = result.insertedId;
 
+      const incObj = {};
+      (chat.participants || []).forEach(p => { 
+        if (String(p) !== req.userId) incObj[`unreadCounts.${p}`] = 1; 
+      });
+
       await db.collection('chats').updateOne(
         { _id: toObjectId(chatId) },
-        { $set: { lastMessage: { _id: result.insertedId, content: sanitizedContent, senderId: req.userId, createdAt: now }, updatedAt: now } }
+        { 
+          $set: { lastMessage: { _id: result.insertedId, content: sanitizedContent, senderId: req.userId, createdAt: now }, updatedAt: now },
+          ...(Object.keys(incObj).length > 0 ? { $inc: incObj } : {})
+        }
       );
 
       const sender = await getCachedUser(db, req.userId);
@@ -932,6 +965,9 @@ async function startServer() {
       participants.forEach(pid => {
         if (String(pid) !== req.userId) {
           safeEmit(io, `user:${pid}`, 'message:new', buildSocketEvent('message:new', { message: normalized }, { chatId }));
+          if (resolvedMentions.includes(String(pid))) {
+            safeEmit(io, `user:${pid}`, 'message:mention', buildSocketEvent('message:mention', { message: normalized }, { chatId }));
+          }
         }
       });
 
@@ -951,6 +987,118 @@ async function startServer() {
     }
   });
 
+  // ==========================================================================
+  // FILE UPLOAD ROUTE (Voice, Image, Video via Multer → Cloudinary)
+  // ==========================================================================
+
+  app.post('/api/messages/upload', auth, upload.single('file'), async (req, res) => {
+    try {
+      if (!req.file) return errorResponse(res, 400, 'No file uploaded', 'NO_FILE');
+
+      const { chatId, type, duration, clientMessageId } = req.body;
+      if (!chatId) return errorResponse(res, 400, 'chatId is required', 'MISSING_CHAT_ID');
+
+      const chatObjId = toObjectId(chatId);
+      if (!chatObjId) return errorResponse(res, 400, 'Invalid chatId', 'INVALID_CHAT_ID');
+
+      const chat = await db.collection('chats').findOne(
+        { _id: chatObjId, participants: req.userId },
+        { projection: { _id: 1, participants: 1 } }
+      );
+      if (!chat) return errorResponse(res, 403, 'Not a participant of this chat', 'NOT_PARTICIPANT');
+
+      // Deduplicate
+      if (clientMessageId && typeof clientMessageId === 'string') {
+        const existing = await db.collection('messages').findOne({ clientMessageId }, { projection: { _id: 1 } });
+        if (existing) {
+          const sender = await getCachedUser(db, req.userId);
+          const n = normalizeMessage(existing);
+          n.sender = sender;
+          return successResponse(res, { message: n, deduplicated: true });
+        }
+      }
+
+      // Stream upload to Cloudinary
+      const resourceType = (type === 'voice' || type === 'video') ? 'video' : 'image';
+      const folder = `chatflow/${chatId}`;
+
+      const uploadResult = await new Promise((resolve, reject) => {
+        const uploadStream = cloudinary.uploader.upload_stream(
+          { resource_type: resourceType, folder, format: type === 'voice' ? 'mp3' : undefined },
+          (error, result) => {
+            if (error) reject(error);
+            else resolve(result);
+          }
+        );
+        streamifier.createReadStream(req.file.buffer).pipe(uploadStream);
+      });
+
+      const fileUrl = uploadResult.secure_url;
+      const parsedDuration = parseInt(duration, 10) || Math.round(uploadResult.duration || 0);
+
+      const now = new Date().toISOString();
+      const messageDoc = {
+        chatId,
+        senderId: req.userId,
+        content: '',
+        type: type || 'voice',
+        attachments: [{
+          type: type || 'voice',
+          url: fileUrl,
+          size: req.file.size,
+          name: req.file.originalname || 'upload',
+        }],
+        reactions: {},
+        mentions: [],
+        replyTo: null,
+        isEdited: false,
+        isDeleted: false,
+        clientMessageId: clientMessageId || null,
+        status: 'sent',
+        metadata: { duration: parsedDuration, cloudinaryId: uploadResult.public_id },
+        createdAt: now,
+        updatedAt: now,
+      };
+
+      const result = await db.collection('messages').insertOne(messageDoc);
+      messageDoc._id = result.insertedId;
+
+      // Increment unread counts for other participants
+      const incObj = {};
+      (chat.participants || []).forEach(p => {
+        if (String(p) !== req.userId) incObj[`unreadCounts.${p}`] = 1;
+      });
+
+      await db.collection('chats').updateOne(
+        { _id: chatObjId },
+        {
+          $set: {
+            lastMessage: { _id: result.insertedId, content: type === 'voice' ? '🎤 Voice message' : '📎 Attachment', senderId: req.userId, createdAt: now },
+            updatedAt: now,
+          },
+          ...(Object.keys(incObj).length > 0 ? { $inc: incObj } : {}),
+        }
+      );
+
+      const sender = await getCachedUser(db, req.userId);
+      const normalized = normalizeMessage(messageDoc);
+      normalized.sender = sender;
+
+      // Broadcast to chat room and individual users
+      safeEmit(io, `chat:${chatId}`, 'message:new', buildSocketEvent('message:new', { message: normalized }, { chatId, userId: req.userId }));
+      (chat.participants || []).forEach(pid => {
+        if (String(pid) !== req.userId) {
+          safeEmit(io, `user:${pid}`, 'message:new', buildSocketEvent('message:new', { message: normalized }, { chatId }));
+        }
+      });
+
+      successResponse(res, { message: normalized }, 201);
+    } catch (err) {
+      console.error('[POST /api/messages/upload] Error:', err.message, err.stack);
+      errorResponse(res, 500, 'Failed to upload and send message', 'UPLOAD_ERROR');
+    }
+  });
+
   app.post('/api/messages/:chatId/read', auth, async (req, res) => {
     try {
       const chatId = ensureChatIdString(req.params.chatId);
@@ -958,6 +1106,11 @@ async function startServer() {
 
       const chat = await db.collection('chats').findOne({ _id: toObjectId(chatId), participants: req.userId }, { projection: { _id: 1, participants: 1 } });
       if (!chat) return errorResponse(res, 403, 'Not a participant of this chat', 'NOT_PARTICIPANT');
+
+      await db.collection('chats').updateOne(
+        { _id: toObjectId(chatId) },
+        { $set: { [`unreadCounts.${req.userId}`]: 0 } }
+      );
 
       const now = new Date().toISOString();
       const result = await db.collection('messages').updateMany(
@@ -1280,8 +1433,3 @@ async function startServer() {
   process.on('SIGTERM', shutdown);
   process.on('SIGINT', shutdown);
 }
-
-startServer().catch((err) => {
-  console.error('[ChatFlow] Failed to start:', err);
-  process.exit(1);
-});
