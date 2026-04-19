@@ -1,9 +1,12 @@
 .env
+.env.local
+.env.production
+.env.*
 .vercel
 .env.example
 node_modules
 dist
 build
 server.jsnode_modules
-.env
 .DS_Store
+*.log
