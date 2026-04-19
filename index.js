@@ -529,8 +529,8 @@ async function handleTypingStop(socket, io, db, chatId, userId, username) {
   } else {
     safeEmit(io, `chat:${chatId}`, 'typing:stop', event);
   }
-}
 
+  // Also notify individual participants
   const chat = await db.collection('chats').findOne({ _id: toObjectId(chatId) }, { projection: { participants: 1 } });
   if (chat) {
     chat.participants.forEach(pid => {
