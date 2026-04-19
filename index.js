@@ -201,6 +201,12 @@ async function getOrCreateDirectChat(db, userAId, userBId) {
 }
 
 async function resolveChat(db, currentUserId, idOrUserId) {
+  console.log('[RESOLVE CHAT DEBUG]', {
+    currentUserId,
+    idOrUserId,
+    idStr: String(idOrUserId).trim()
+  });
+
   if (!idOrUserId) return null;
   
   const idStr = String(idOrUserId).trim();
@@ -1273,6 +1279,12 @@ async function startServer() {
 
   app.post('/api/messages/:chatId', auth, async (req, res) => {
     try {
+      console.log('[MESSAGE DEBUG]', {
+        paramChatId: req.params.chatId,
+        userId: req.userId,
+        body: req.body
+      });
+
       const chat = await resolveChat(db, req.userId, req.params.chatId);
       if (!chat) return errorResponse(res, 400, 'Invalid chat or user ID', 'INVALID_CHAT_ID');
       const chatId = String(chat._id);
@@ -1398,6 +1410,21 @@ async function startServer() {
 
   app.post('/api/messages/upload', auth, upload.single('file'), async (req, res) => {
     try {
+      console.log('[UPLOAD DEBUG]', {
+        body: req.body,
+        chatId: req.body?.chatId,
+        chat_id: req.body?.chat_id,
+        userId: req.userId,
+        file: req.file ? {
+          fieldname: req.file.fieldname,
+          mimetype: req.file.mimetype,
+          size: req.file.size
+        } : null,
+        headers: {
+          contentType: req.headers['content-type']
+        }
+      });
+
       if (!req.file) return errorResponse(res, 400, 'No file uploaded', 'NO_FILE');
 
       const { chatId, chat_id, type, duration, clientMessageId } = req.body;
