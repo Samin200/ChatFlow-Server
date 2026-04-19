@@ -86,8 +86,8 @@ const CONFIG = {
     userTtlMs: 5 * 60 * 1000,
   },
   vapid: {
-    publicKey: process.env.VAPID_PUBLIC_KEY || 'BK72WwV-RLZgPKJUvX9fXau4kXhYqQxBCJ71tUcMxGFgg7GqlnLeLJCb0XVCydbXWOH0zRnZJwDtITPmlEydWPw',
-    privateKey: process.env.VAPID_PRIVATE_KEY || '5QcW_VH_-YJpptDt7RCKphsEJoy59YwdyVjL7rkdWJE',
+    publicKey: process.env.VAPID_PUBLIC_KEY,
+    privateKey: process.env.VAPID_PRIVATE_KEY,
     email: process.env.VAPID_EMAIL || 'mailto:support@chatflow.com',
   },
 };
@@ -155,6 +155,46 @@ function validateAttachments(attachments) {
     .slice(0, CONFIG.validation.maxAttachments)
     .map(validateAttachment)
     .filter(Boolean);
+}
+
+async function getOrCreateDirectChat(db, userAId, userBId) {
+  const participants = [String(userAId), String(userBId)].sort();
+  const existing = await db.collection('chats').findOne({
+    type: 'direct',
+    participants: { $all: participants, $size: 2 }
+  });
+  if (existing) return existing;
+
+  const newChat = {
+    type: 'direct',
+    participants,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    lastMessage: null,
+    metadata: {}
+  };
+  const result = await db.collection('chats').insertOne(newChat);
+  return { _id: result.insertedId, ...newChat };
+}
+
+async function resolveChat(db, currentUserId, idOrUserId) {
+  const objId = toObjectId(idOrUserId);
+  if (!objId) return null;
+
+  // 1. Check if it's an existing Chat
+  const chat = await db.collection('chats').findOne({
+    _id: objId,
+    participants: String(currentUserId)
+  });
+  if (chat) return chat;
+
+  // 2. Check if it's a User ID for a direct chat
+  const otherUser = await db.collection('users').findOne({ _id: objId }, { projection: { _id: 1 } });
+  if (otherUser) {
+    return await getOrCreateDirectChat(db, currentUserId, idOrUserId);
+  }
+
+  return null;
 }
 
 function ensureChatIdString(chatId) {
@@ -442,27 +482,50 @@ function setUserOffline(io, db, userId, socketId) {
 // SECTION 7: TYPING INDICATOR MANAGEMENT
 // ============================================================================
 
-function handleTypingStart(io, chatId, userId, username) {
+async function handleTypingStart(io, db, chatId, userId, username) {
   const key = `${chatId}:${userId}`;
   const now = Date.now();
   const existing = typingState.get(key);
   if (existing && now - existing.lastEmitAt < CONFIG.typing.throttleMs) {
     clearTimeout(existing.timer);
-    existing.timer = setTimeout(() => handleTypingStop(io, chatId, userId, username), CONFIG.typing.expireMs);
+    existing.timer = setTimeout(() => handleTypingStop(io, db, chatId, userId, username), CONFIG.typing.expireMs);
     return;
   }
   if (existing?.timer) clearTimeout(existing.timer);
-  const timer = setTimeout(() => handleTypingStop(io, chatId, userId, username), CONFIG.typing.expireMs);
+  const timer = setTimeout(() => handleTypingStop(io, db, chatId, userId, username), CONFIG.typing.expireMs);
   typingState.set(key, { timer, lastEmitAt: now });
-  safeEmit(io, `chat:${chatId}`, 'typing:start', buildSocketEvent('typing:start', { username: username || 'Unknown' }, { chatId, userId }));
+  
+  const event = buildSocketEvent('typing:start', { username: username || 'Unknown' }, { chatId, userId });
+  safeEmit(io, `chat:${chatId}`, 'typing:start', event);
+  
+  // Also notify individual participants to ensure cross-account delivery
+  const chat = await db.collection('chats').findOne({ _id: toObjectId(chatId) }, { projection: { participants: 1 } });
+  if (chat) {
+    chat.participants.forEach(pid => {
+      if (String(pid) !== String(userId)) {
+        safeEmit(io, `user:${pid}`, 'typing:start', event);
+      }
+    });
+  }
 }
 
-function handleTypingStop(io, chatId, userId, username) {
+async function handleTypingStop(io, db, chatId, userId, username) {
   const key = `${chatId}:${userId}`;
   const existing = typingState.get(key);
   if (existing?.timer) clearTimeout(existing.timer);
   typingState.delete(key);
-  safeEmit(io, `chat:${chatId}`, 'typing:stop', buildSocketEvent('typing:stop', { username: username || 'Unknown' }, { chatId, userId }));
+  
+  const event = buildSocketEvent('typing:stop', { username: username || 'Unknown' }, { chatId, userId });
+  safeEmit(io, `chat:${chatId}`, 'typing:stop', event);
+
+  const chat = await db.collection('chats').findOne({ _id: toObjectId(chatId) }, { projection: { participants: 1 } });
+  if (chat) {
+    chat.participants.forEach(pid => {
+      if (String(pid) !== String(userId)) {
+        safeEmit(io, `user:${pid}`, 'typing:stop', event);
+      }
+    });
+  }
 }
 
 // ============================================================================
@@ -1141,11 +1204,9 @@ async function startServer() {
 
   app.post('/api/messages/:chatId', auth, async (req, res) => {
     try {
-      const chatId = ensureChatIdString(req.params.chatId);
-      if (!chatId) return errorResponse(res, 400, 'Invalid chatId', 'INVALID_CHAT_ID');
-
-      const chat = await db.collection('chats').findOne({ _id: toObjectId(chatId), participants: req.userId }, { projection: { _id: 1, participants: 1 } });
-      if (!chat) return errorResponse(res, 403, 'Not a participant of this chat', 'NOT_PARTICIPANT');
+      const chat = await resolveChat(db, req.userId, req.params.chatId);
+      if (!chat) return errorResponse(res, 400, 'Invalid chat or user ID', 'INVALID_CHAT_ID');
+      const chatId = String(chat._id);
 
       const { content, type, attachments, replyTo, mentions, clientMessageId } = req.body;
       const sanitizedContent = sanitizeText(content || '');
@@ -1189,6 +1250,14 @@ async function startServer() {
         attachments: validAttachments, reactions: {}, mentions: resolvedMentions,
         replyTo: replyTo || null, isEdited: false, isDeleted: false,
         clientMessageId: clientMessageId || null, status: 'sent',
+      // Bug 3 Fix: Check if any other participant is online to mark as delivered immediately
+      const recipients = (chat.participants || []).filter(p => String(p) !== req.userId);
+      const isAnyRecipientOnline = recipients.some(pid => {
+        const entry = onlineUsers.get(String(pid));
+        return entry && entry.isOnline;
+      });
+      if (isAnyRecipientOnline) messageDoc.status = 'delivered';
+
         linkPreview,
         createdAt: now, updatedAt: now,
       };
@@ -1259,17 +1328,11 @@ async function startServer() {
     try {
       if (!req.file) return errorResponse(res, 400, 'No file uploaded', 'NO_FILE');
 
-      const { chatId, type, duration, clientMessageId } = req.body;
-      if (!chatId) return errorResponse(res, 400, 'chatId is required', 'MISSING_CHAT_ID');
+      const { chatId: rawChatId, type, duration, clientMessageId } = req.body;
 
-      const chatObjId = toObjectId(chatId);
-      if (!chatObjId) return errorResponse(res, 400, 'Invalid chatId', 'INVALID_CHAT_ID');
-
-      const chat = await db.collection('chats').findOne(
-        { _id: chatObjId, participants: req.userId },
-        { projection: { _id: 1, participants: 1 } }
-      );
-      if (!chat) return errorResponse(res, 403, 'Not a participant of this chat', 'NOT_PARTICIPANT');
+      const chat = await resolveChat(db, req.userId, rawChatId);
+      if (!chat) return errorResponse(res, 400, 'Invalid chatId or recipient', 'INVALID_CHAT_ID');
+      const chatId = String(chat._id);
 
       // Deduplicate
       if (clientMessageId && typeof clientMessageId === 'string') {
@@ -1648,14 +1711,14 @@ async function startServer() {
     socket.on('typing:start', (data) => {
       try {
         const chatId = ensureChatIdString(data?.chatId);
-        if (chatId) handleTypingStart(io, chatId, userId, username);
+        if (chatId) handleTypingStart(io, db, chatId, userId, username);
       } catch {}
     });
 
     socket.on('typing:stop', (data) => {
       try {
         const chatId = ensureChatIdString(data?.chatId);
-        if (chatId) handleTypingStop(io, chatId, userId, username);
+        if (chatId) handleTypingStop(io, db, chatId, userId, username);
       } catch {}
     });
 
@@ -1756,7 +1819,7 @@ async function startServer() {
       for (const [key] of typingState) {
         if (key.endsWith(`:${userId}`)) {
           const [chatId] = key.split(':');
-          handleTypingStop(io, chatId, userId, username);
+          handleTypingStop(io, db, chatId, userId, username);
         }
       }
     });
