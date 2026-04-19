@@ -178,7 +178,9 @@ async function getOrCreateDirectChat(db, userAId, userBId) {
 }
 
 async function resolveChat(db, currentUserId, idOrUserId) {
-  const objId = toObjectId(idOrUserId);
+  if (!idOrUserId) return null;
+  const idStr = String(idOrUserId);
+  const objId = toObjectId(idStr);
   if (!objId) return null;
 
   // 1. Check if it's an existing Chat
@@ -191,7 +193,7 @@ async function resolveChat(db, currentUserId, idOrUserId) {
   // 2. Check if it's a User ID for a direct chat
   const otherUser = await db.collection('users').findOne({ _id: objId }, { projection: { _id: 1 } });
   if (otherUser) {
-    return await getOrCreateDirectChat(db, currentUserId, idOrUserId);
+    return await getOrCreateDirectChat(db, currentUserId, idStr);
   }
 
   return null;
@@ -482,41 +484,52 @@ function setUserOffline(io, db, userId, socketId) {
 // SECTION 7: TYPING INDICATOR MANAGEMENT
 // ============================================================================
 
-async function handleTypingStart(io, db, chatId, userId, username) {
+async function handleTypingStart(socket, io, db, chatId, userId, username) {
   const key = `${chatId}:${userId}`;
   const now = Date.now();
   const existing = typingState.get(key);
   if (existing && now - existing.lastEmitAt < CONFIG.typing.throttleMs) {
     clearTimeout(existing.timer);
-    existing.timer = setTimeout(() => handleTypingStop(io, db, chatId, userId, username), CONFIG.typing.expireMs);
+    existing.timer = setTimeout(() => handleTypingStop(socket, io, db, chatId, userId, username), CONFIG.typing.expireMs);
     return;
   }
   if (existing?.timer) clearTimeout(existing.timer);
-  const timer = setTimeout(() => handleTypingStop(io, db, chatId, userId, username), CONFIG.typing.expireMs);
+  const timer = setTimeout(() => handleTypingStop(socket, io, db, chatId, userId, username), CONFIG.typing.expireMs);
   typingState.set(key, { timer, lastEmitAt: now });
   
   const event = buildSocketEvent('typing:start', { username: username || 'Unknown' }, { chatId, userId });
-  safeEmit(io, `chat:${chatId}`, 'typing:start', event);
+  // Bug 2 Fix: Use socket.to() to exclude the sender from their own typing event
+  if (socket) {
+    socket.to(`chat:${chatId}`).emit('typing:start', event);
+  } else {
+    safeEmit(io, `chat:${chatId}`, 'typing:start', event);
+  }
   
   // Also notify individual participants to ensure cross-account delivery
   const chat = await db.collection('chats').findOne({ _id: toObjectId(chatId) }, { projection: { participants: 1 } });
   if (chat) {
     chat.participants.forEach(pid => {
       if (String(pid) !== String(userId)) {
+        // Individual rooms usually handle one socket each, io is safest here as we aren't broadcasting to the sender's user room anyway
         safeEmit(io, `user:${pid}`, 'typing:start', event);
       }
     });
   }
 }
 
-async function handleTypingStop(io, db, chatId, userId, username) {
+async function handleTypingStop(socket, io, db, chatId, userId, username) {
   const key = `${chatId}:${userId}`;
   const existing = typingState.get(key);
   if (existing?.timer) clearTimeout(existing.timer);
   typingState.delete(key);
   
   const event = buildSocketEvent('typing:stop', { username: username || 'Unknown' }, { chatId, userId });
-  safeEmit(io, `chat:${chatId}`, 'typing:stop', event);
+  if (socket) {
+    socket.to(`chat:${chatId}`).emit('typing:stop', event);
+  } else {
+    safeEmit(io, `chat:${chatId}`, 'typing:stop', event);
+  }
+}
 
   const chat = await db.collection('chats').findOne({ _id: toObjectId(chatId) }, { projection: { participants: 1 } });
   if (chat) {
@@ -1245,19 +1258,17 @@ async function startServer() {
         }
       }
 
-      const messageDoc = {
-        chatId, senderId: req.userId, content: sanitizedContent, type: type || 'text',
-        attachments: validAttachments, reactions: {}, mentions: resolvedMentions,
-        replyTo: replyTo || null, isEdited: false, isDeleted: false,
-        clientMessageId: clientMessageId || null, status: 'sent',
-      // Bug 3 Fix: Check if any other participant is online to mark as delivered immediately
       const recipients = (chat.participants || []).filter(p => String(p) !== req.userId);
       const isAnyRecipientOnline = recipients.some(pid => {
         const entry = onlineUsers.get(String(pid));
         return entry && entry.isOnline;
       });
-      if (isAnyRecipientOnline) messageDoc.status = 'delivered';
 
+      const messageDoc = {
+        chatId, senderId: req.userId, content: sanitizedContent, type: type || 'text',
+        attachments: validAttachments, reactions: {}, mentions: resolvedMentions,
+        replyTo: replyTo || null, isEdited: false, isDeleted: false,
+        clientMessageId: clientMessageId || null, status: isAnyRecipientOnline ? 'delivered' : 'sent',
         linkPreview,
         createdAt: now, updatedAt: now,
       };
@@ -1283,6 +1294,11 @@ async function startServer() {
       normalized.sender = sender;
 
       safeEmit(io, `chat:${chatId}`, 'message:new', buildSocketEvent('message:new', { message: normalized }, { chatId, userId: req.userId }));
+
+      // Bug 3: If marked as delivered, notify the sender immediately so they see the double grey ticks
+      if (messageDoc.status === 'delivered') {
+        safeEmit(io, `user:${req.userId}`, 'message:status', buildSocketEvent('message:status', { messageId: String(messageDoc._id), status: 'delivered', chatId }, { chatId }));
+      }
 
       // Also notify individual participants (ensures they see it even if they haven't joined the chat room yet)
       const participants = chat.participants || [];
@@ -1449,6 +1465,7 @@ async function startServer() {
       if (result.modifiedCount > 0) {
         const otherParticipant = chat.participants.find(p => String(p) !== req.userId);
         if (otherParticipant) {
+          // Bug 3: Notify the sender that their messages were seen
           safeEmit(io, `user:${otherParticipant}`, 'message:status', buildSocketEvent('message:status', { status: 'seen', chatId }, { chatId }));
         }
       }
@@ -1711,14 +1728,14 @@ async function startServer() {
     socket.on('typing:start', (data) => {
       try {
         const chatId = ensureChatIdString(data?.chatId);
-        if (chatId) handleTypingStart(io, db, chatId, userId, username);
+        if (chatId) handleTypingStart(socket, io, db, chatId, userId, username);
       } catch {}
     });
 
     socket.on('typing:stop', (data) => {
       try {
         const chatId = ensureChatIdString(data?.chatId);
-        if (chatId) handleTypingStop(io, db, chatId, userId, username);
+        if (chatId) handleTypingStop(socket, io, db, chatId, userId, username);
       } catch {}
     });
 
