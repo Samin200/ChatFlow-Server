@@ -15,18 +15,30 @@ require('dotenv').config();
 const REQUIRED_ENV_VARS = [
   'MONGODB_URI',
   'JWT_SECRET',
-  'CLOUDINARY_CLOUD_NAME',
-  'CLOUDINARY_API_KEY',
-  'CLOUDINARY_API_SECRET',
   'VAPID_PUBLIC_KEY',
   'VAPID_PRIVATE_KEY',
   'VAPID_MAILTO',
 ];
 
 const missing = REQUIRED_ENV_VARS.filter((k) => !process.env[k]);
+const hasCloudinaryUrl = Boolean(process.env.CLOUDINARY_URL);
+const hasCloudinaryParts = Boolean(
+  process.env.CLOUDINARY_CLOUD_NAME &&
+  process.env.CLOUDINARY_API_KEY &&
+  process.env.CLOUDINARY_API_SECRET
+);
 if (missing.length > 0) {
   console.error('Missing required environment variables:');
   missing.forEach((k) => console.error(' -', k));
+  process.exit(1);
+}
+if (!hasCloudinaryUrl && !hasCloudinaryParts) {
+  console.error('Missing Cloudinary configuration. Provide either:');
+  console.error(' - CLOUDINARY_URL');
+  console.error('or all of:');
+  console.error(' - CLOUDINARY_CLOUD_NAME');
+  console.error(' - CLOUDINARY_API_KEY');
+  console.error(' - CLOUDINARY_API_SECRET');
   process.exit(1);
 }
 
@@ -45,16 +57,25 @@ const cheerio = require('cheerio');
 
 const SALT_ROUNDS = 10;
 
-// Configure Cloudinary from env
+// Configure Cloudinary
 if (process.env.CLOUDINARY_URL) {
-  // CLOUDINARY_URL auto-configures cloudinary
-} else if (process.env.CLOUDINARY_CLOUD_NAME) {
+  cloudinary.config({ secure: true });
+  console.log('[Cloudinary] Configured via CLOUDINARY_URL');
+} else {
   cloudinary.config({
     cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
     api_key: process.env.CLOUDINARY_API_KEY,
     api_secret: process.env.CLOUDINARY_API_SECRET,
+    secure: true
   });
+  console.log('[Cloudinary] Configured via individual env vars');
 }
+
+// Verify config loaded correctly
+const cConfig = cloudinary.config();
+console.log('[Cloudinary] cloud_name:', cConfig.cloud_name);
+console.log('[Cloudinary] api_key prefix:', String(cConfig.api_key || '').slice(0, 6));
+console.log('[Cloudinary] api_secret prefix:', String(cConfig.api_secret || '').slice(0, 4));
 const CLOUDINARY_STATUS = 'configured';
 
 // Multer: store files in memory (we stream to Cloudinary)
