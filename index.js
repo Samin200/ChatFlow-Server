@@ -26,6 +26,9 @@ const bcrypt = require('bcrypt');
 const multer = require('multer');
 const cloudinary = require('cloudinary').v2;
 const streamifier = require('streamifier');
+const webpush = require('web-push');
+const axios = require('axios');
+const cheerio = require('cheerio');
 
 const SALT_ROUNDS = 10;
 
@@ -82,7 +85,18 @@ const CONFIG = {
   cache: {
     userTtlMs: 5 * 60 * 1000,
   },
+  vapid: {
+    publicKey: process.env.VAPID_PUBLIC_KEY || 'BK72WwV-RLZgPKJUvX9fXau4kXhYqQxBCJ71tUcMxGFgg7GqlnLeLJCb0XVCydbXWOH0zRnZJwDtITPmlEydWPw',
+    privateKey: process.env.VAPID_PRIVATE_KEY || '5QcW_VH_-YJpptDt7RCKphsEJoy59YwdyVjL7rkdWJE',
+    email: process.env.VAPID_EMAIL || 'mailto:support@chatflow.com',
+  },
 };
+
+webpush.setVapidDetails(
+  CONFIG.vapid.email,
+  CONFIG.vapid.publicKey,
+  CONFIG.vapid.privateKey
+);
 
 // ============================================================================
 // SECTION 2: HELPERS — Validation & Sanitization
@@ -148,6 +162,68 @@ function ensureChatIdString(chatId) {
   if (isValidObjectId(String(chatId))) return String(chatId);
   if (chatId instanceof ObjectId) return String(chatId);
   return null;
+}
+
+async function sendPushNotification(db, userId, payload) {
+  try {
+    const subscriptions = await db.collection('pushSubscriptions').find({ userId: String(userId) }).toArray();
+    if (subscriptions.length === 0) return;
+
+    const pushPayload = JSON.stringify(payload);
+    const results = await Promise.allSettled(
+      subscriptions.map((sub) => {
+        const { subscription } = sub;
+        return webpush.sendNotification(subscription, pushPayload);
+      })
+    );
+
+    // Cleanup expired subscriptions
+    for (let i = 0; i < results.length; i++) {
+      if (results[i].status === 'rejected') {
+        const err = results[i].reason;
+        if (err.statusCode === 404 || err.statusCode === 410) {
+          await db.collection('pushSubscriptions').deleteOne({ _id: subscriptions[i]._id });
+        }
+      }
+    }
+  } catch (err) {
+    console.error('[Push] Error sending notification:', err.message);
+  }
+}
+
+async function getLinkPreview(db, url) {
+  try {
+    const cached = await db.collection('linkPreviews').findOne({ url });
+    if (cached) return cached.preview;
+
+    const { data: html } = await axios.get(url, {
+      timeout: 5000,
+      headers: { 'User-Agent': 'ChatFlow-Bot/1.0' }
+    });
+    const $ = cheerio.load(html);
+
+    const preview = {
+      url,
+      title: $('meta[property="og:title"]').attr('content') || $('title').text() || '',
+      description: $('meta[property="og:description"]').attr('content') || $('meta[name="description"]').attr('content') || '',
+      image: $('meta[property="og:image"]').attr('content') || '',
+      siteName: $('meta[property="og:site_name"]').attr('content') || '',
+    };
+
+    // Only cache if we got something meaningful
+    if (preview.title) {
+      await db.collection('linkPreviews').updateOne(
+        { url },
+        { $set: { url, preview, createdAt: new Date().toISOString() } },
+        { upsert: true }
+      );
+    }
+
+    return preview.title ? preview : null;
+  } catch (err) {
+    console.error('[LinkPreview] Error:', err.message);
+    return null;
+  }
 }
 
 function isValidWhatsapp(value) {
@@ -471,6 +547,8 @@ async function startServer() {
   const db = mongoClient.db(CONFIG.dbName);
   console.log('[MongoDB] Connected to', CONFIG.dbName);
 
+  const activeCalls = new Map(); // socketId -> { callId, otherId, targetUserId }
+
   await Promise.all([
     db.collection('messages').createIndex({ chatId: 1, createdAt: -1 }),
     db.collection('messages').createIndex({ senderId: 1, status: 1 }),
@@ -481,6 +559,8 @@ async function startServer() {
     db.collection('users').createIndex({ displayName: 1 }),
     db.collection('sessions').createIndex({ token: 1 }, { unique: true }),
     db.collection('forgotPasswordRequests').createIndex({ status: 1, createdAt: -1 }),
+    db.collection('pushSubscriptions').createIndex({ userId: 1 }),
+    db.collection('linkPreviews').createIndex({ url: 1 }, { unique: true }),
     db.collection('forgotPasswordRequests').createIndex(
       { username: 1, whatsapp: 1, status: 1 },
       { partialFilterExpression: { status: 'pending' } }
@@ -1096,11 +1176,20 @@ async function startServer() {
       }
 
       const now = new Date().toISOString();
+      let linkPreview = null;
+      if (sanitizedContent && sanitizedContent.includes('http')) {
+        const urlMatch = sanitizedContent.match(/https?:\/\/[^\s]+/);
+        if (urlMatch) {
+          linkPreview = await getLinkPreview(db, urlMatch[0]);
+        }
+      }
+
       const messageDoc = {
         chatId, senderId: req.userId, content: sanitizedContent, type: type || 'text',
         attachments: validAttachments, reactions: {}, mentions: resolvedMentions,
         replyTo: replyTo || null, isEdited: false, isDeleted: false,
         clientMessageId: clientMessageId || null, status: 'sent',
+        linkPreview,
         createdAt: now, updatedAt: now,
       };
 
@@ -1128,12 +1217,21 @@ async function startServer() {
 
       // Also notify individual participants (ensures they see it even if they haven't joined the chat room yet)
       const participants = chat.participants || [];
-      participants.forEach(pid => {
+      participants.forEach(async (pid) => {
         if (String(pid) !== req.userId) {
           safeEmit(io, `user:${pid}`, 'message:new', buildSocketEvent('message:new', { message: normalized }, { chatId }));
           if (resolvedMentions.includes(String(pid))) {
             safeEmit(io, `user:${pid}`, 'message:mention', buildSocketEvent('message:mention', { message: normalized }, { chatId }));
           }
+
+          // Trigger Push Notification
+          const isMentioned = resolvedMentions.includes(String(pid));
+          await sendPushNotification(db, pid, {
+            title: isMentioned ? `@${sender.username} mentioned you` : sender.displayName || sender.username,
+            body: normalized.text || 'Shared a media',
+            tag: chatId,
+            data: { chatId, messageId: String(result.insertedId) }
+          });
         }
       });
 
@@ -1185,7 +1283,8 @@ async function startServer() {
       }
 
       // Stream upload to Cloudinary
-      const resourceType = (type === 'voice' || type === 'video') ? 'video' : 'image';
+      const fileType = type || (req.file.mimetype.startsWith('image/') ? 'image' : req.file.mimetype.startsWith('audio/') ? 'voice' : 'video');
+      const resourceType = (fileType === 'voice' || fileType === 'video') ? 'video' : 'image';
       const folder = `chatflow/${chatId}`;
 
       const uploadResult = await new Promise((resolve, reject) => {
@@ -1408,6 +1507,34 @@ async function startServer() {
     }
   });
 
+  // ==========================================================================
+  // SECTION 11g: NOTIFICATIONS
+  // ==========================================================================
+
+  app.post('/api/notifications/subscribe', auth, async (req, res) => {
+    try {
+      const { subscription, deviceId } = req.body;
+      if (!subscription || !subscription.endpoint || !subscription.keys) {
+        return errorResponse(res, 400, 'Invalid subscription object', 'INVALID_SUBSCRIPTION');
+      }
+
+      const query = { userId: req.userId };
+      if (deviceId) query.deviceId = deviceId;
+      else query.subscription = subscription;
+
+      await db.collection('pushSubscriptions').updateOne(
+        query,
+        { $set: { userId: req.userId, subscription, deviceId: deviceId || null, updatedAt: new Date().toISOString() } },
+        { upsert: true }
+      );
+
+      successResponse(res, { success: true });
+    } catch (err) {
+      console.error('[POST /api/notifications/subscribe] Error:', err.message);
+      errorResponse(res, 500, 'Failed to subscribe', 'SUBSCRIBE_ERROR');
+    }
+  });
+
   app.patch('/api/admin/forgot-password-requests/:id', auth, requireAdmin, async (req, res) => {
     try {
       const { id } = req.params;
@@ -1533,9 +1660,20 @@ async function startServer() {
     });
 
     // --- WebRTC Signaling ---
-    socket.on('call:invite', (data) => {
+    socket.on('call:invite', async (data) => {
       if (data?.targetId) {
+        // Track the caller
+        activeCalls.set(socket.id, { callId: data.callId, otherId: data.targetId, role: 'caller' });
+        
         socket.to(`user:${data.targetId}`).emit('call:invite', { ...data, callerId: userId });
+        
+        // Push notification for call
+        sendPushNotification(db, data.targetId, {
+          title: `Incoming ${data.isVideo ? 'Video' : 'Voice'} Call`,
+          body: `${username} is calling you...`,
+          tag: `call_${data.callId}`,
+          data: { type: 'call', callId: data.callId, callerId: userId }
+        });
       } else if (data?.chatId) {
         socket.to(`chat:${data.chatId}`).emit('call:invite', { ...data, callerId: userId });
       }
@@ -1543,12 +1681,18 @@ async function startServer() {
 
     socket.on('call:accepted', (data) => {
       if (data?.targetId) {
+        // Track the recipient too (targetId here is the caller)
+        activeCalls.set(socket.id, { callId: data.callId, otherId: data.targetId, role: 'recipient' });
         socket.to(`user:${data.targetId}`).emit('call:accepted', { ...data, responderId: userId });
       }
     });
 
     socket.on('call:rejected', (data) => {
       if (data?.targetId) {
+        // Cleanup the call for both participants
+        for (const [sid, call] of activeCalls.entries()) {
+          if (call.callId === data.callId) activeCalls.delete(sid);
+        }
         socket.to(`user:${data.targetId}`).emit('call:rejected', { ...data, responderId: userId });
       }
     });
@@ -1560,6 +1704,16 @@ async function startServer() {
     });
 
     socket.on('call:ended', (data) => {
+      const callData = activeCalls.get(socket.id);
+      const callIdToRemove = data.callId || callData?.callId;
+      
+      // Cleanup both sides from the Map
+      if (callIdToRemove) {
+        for (const [sid, call] of activeCalls.entries()) {
+          if (call.callId === callIdToRemove) activeCalls.delete(sid);
+        }
+      }
+
       if (data?.targetId) {
         socket.to(`user:${data.targetId}`).emit('call:ended', { ...data, enderId: userId });
       } else if (data?.chatId) {
@@ -1586,6 +1740,18 @@ async function startServer() {
 
     socket.on('disconnect', (reason) => {
       console.log(`[Socket] Disconnected: ${username} (${userId}) — ${reason}`);
+      
+      // Auto-end WebRTC call if exists
+      if (activeCalls.has(socket.id)) {
+        const { callId, otherId } = activeCalls.get(socket.id);
+        socket.to(`user:${otherId}`).emit('call:ended', { callId, enderId: userId, reason: 'disconnected' });
+        
+        // Cleanup all Map entries related to this callId
+        for (const [sid, call] of activeCalls.entries()) {
+          if (call.callId === callId) activeCalls.delete(sid);
+        }
+      }
+
       setUserOffline(io, db, userId, socket.id);
       for (const [key] of typingState) {
         if (key.endsWith(`:${userId}`)) {
