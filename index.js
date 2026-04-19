@@ -1349,7 +1349,7 @@ async function startServer() {
 
       const chat = await resolveChat(db, req.userId, rawChatId);
       if (!chat) return errorResponse(res, 400, 'Invalid chatId or recipient', 'INVALID_CHAT_ID');
-      const chatId = String(chat._id);
+      const resolvedChatId = String(chat._id);
 
       // Deduplicate
       if (clientMessageId && typeof clientMessageId === 'string') {
@@ -1365,7 +1365,7 @@ async function startServer() {
       // Stream upload to Cloudinary
       const fileType = type || (req.file.mimetype.startsWith('image/') ? 'image' : req.file.mimetype.startsWith('audio/') ? 'voice' : 'video');
       const resourceType = (fileType === 'voice' || fileType === 'video') ? 'video' : 'image';
-      const folder = `chatflow/${chatId}`;
+      const folder = `chatflow/${resolvedChatId}`;
 
       const uploadResult = await new Promise((resolve, reject) => {
         const uploadStream = cloudinary.uploader.upload_stream(
@@ -1383,7 +1383,7 @@ async function startServer() {
 
       const now = new Date().toISOString();
       const messageDoc = {
-        chatId,
+        chatId: resolvedChatId,
         senderId: req.userId,
         content: '',
         type: type || 'voice',
@@ -1415,7 +1415,7 @@ async function startServer() {
       });
 
       await db.collection('chats').updateOne(
-        { _id: chatObjId },
+        { _id: toObjectId(resolvedChatId) },
         {
           $set: {
             lastMessage: { _id: result.insertedId, content: type === 'voice' ? '🎤 Voice message' : '📎 Attachment', senderId: req.userId, createdAt: now },
@@ -1430,10 +1430,10 @@ async function startServer() {
       normalized.sender = sender;
 
       // Broadcast to chat room and individual users
-      safeEmit(io, `chat:${chatId}`, 'message:new', buildSocketEvent('message:new', { message: normalized }, { chatId, userId: req.userId }));
+      safeEmit(io, `chat:${resolvedChatId}`, 'message:new', buildSocketEvent('message:new', { message: normalized }, { chatId: resolvedChatId, userId: req.userId }));
       (chat.participants || []).forEach(pid => {
         if (String(pid) !== req.userId) {
-          safeEmit(io, `user:${pid}`, 'message:new', buildSocketEvent('message:new', { message: normalized }, { chatId }));
+          safeEmit(io, `user:${pid}`, 'message:new', buildSocketEvent('message:new', { message: normalized }, { chatId: resolvedChatId }));
         }
       });
 
