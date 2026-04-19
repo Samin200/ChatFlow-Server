@@ -12,8 +12,21 @@ require('dotenv').config();
 // SECTION 0: ENV GUARD
 // ============================================================================
 
-if (!process.env.MONGO_URL) {
-  console.error('[FATAL] Missing MONGO_URL in environment. Set it in .env');
+const REQUIRED_ENV_VARS = [
+  'MONGODB_URI',
+  'JWT_SECRET',
+  'CLOUDINARY_CLOUD_NAME',
+  'CLOUDINARY_API_KEY',
+  'CLOUDINARY_API_SECRET',
+  'VAPID_PUBLIC_KEY',
+  'VAPID_PRIVATE_KEY',
+  'VAPID_MAILTO',
+];
+
+const missing = REQUIRED_ENV_VARS.filter((k) => !process.env[k]);
+if (missing.length > 0) {
+  console.error('Missing required environment variables:');
+  missing.forEach((k) => console.error(' -', k));
   process.exit(1);
 }
 
@@ -42,6 +55,7 @@ if (process.env.CLOUDINARY_URL) {
     api_secret: process.env.CLOUDINARY_API_SECRET,
   });
 }
+const CLOUDINARY_STATUS = 'configured';
 
 // Multer: store files in memory (we stream to Cloudinary)
 const upload = multer({
@@ -55,7 +69,7 @@ const upload = multer({
 
 const CONFIG = {
   port: process.env.PORT || 3001,
-  mongoUri: process.env.MONGO_URL,
+  mongoUri: process.env.MONGODB_URI,
   dbName: process.env.DB_NAME || 'chatflow',
   cors: {
     origin: process.env.CLIENT_URL || 'http://localhost:5173',
@@ -88,15 +102,24 @@ const CONFIG = {
   vapid: {
     publicKey: process.env.VAPID_PUBLIC_KEY,
     privateKey: process.env.VAPID_PRIVATE_KEY,
-    email: process.env.VAPID_EMAIL || 'mailto:support@chatflow.com',
+    email: process.env.VAPID_MAILTO,
   },
 };
 
-webpush.setVapidDetails(
-  CONFIG.vapid.email,
-  CONFIG.vapid.publicKey,
-  CONFIG.vapid.privateKey
-);
+let VAPID_STATUS = 'not_configured';
+try {
+  webpush.setVapidDetails(
+    process.env.VAPID_MAILTO,
+    process.env.VAPID_PUBLIC_KEY,
+    process.env.VAPID_PRIVATE_KEY
+  );
+  VAPID_STATUS = 'configured';
+  console.log('[VAPID] Push notifications configured');
+} catch (err) {
+  console.error('[VAPID] Failed to configure push notifications:', err.message);
+  console.error('Check VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY, VAPID_MAILTO in .env');
+  process.exit(1);
+}
 
 // ============================================================================
 // SECTION 2: HELPERS — Validation & Sanitization
@@ -619,7 +642,15 @@ async function createSession(db, userId) {
 
 async function startServer() {
   const mongoClient = new MongoClient(CONFIG.mongoUri);
-  await mongoClient.connect();
+  let MONGODB_STATUS = 'disconnected';
+  try {
+    await mongoClient.connect();
+    MONGODB_STATUS = 'connected';
+  } catch (err) {
+    console.error('[MongoDB] Failed to connect. Check MONGODB_URI and network access.');
+    console.error('[MongoDB] Error:', err.message);
+    throw err;
+  }
   const db = mongoClient.db(CONFIG.dbName);
   console.log('[MongoDB] Connected to', CONFIG.dbName);
 
@@ -828,7 +859,13 @@ async function startServer() {
   // ==========================================================================
 
   app.get('/api/health', (req, res) => {
-    successResponse(res, { status: 'ok', uptime: process.uptime(), online: onlineUsers.size });
+    res.json({
+      status: 'ok',
+      mongodb: MONGODB_STATUS,
+      vapid: VAPID_STATUS,
+      cloudinary: CLOUDINARY_STATUS,
+      uptime: Math.floor(process.uptime()),
+    });
   });
 
   // ==========================================================================
