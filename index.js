@@ -1277,6 +1277,130 @@ async function startServer() {
     }
   });
 
+
+  // ==========================================================================
+  // FILE UPLOAD ROUTE (Voice, Image, Video via Multer → Cloudinary)
+  // ==========================================================================
+
+  app.post('/api/messages/upload', auth, upload.single('file'), async (req, res) => {
+    try {
+      console.log('[UPLOAD DEBUG]', {
+        body: req.body,
+        chatId: req.body?.chatId,
+        chat_id: req.body?.chat_id,
+        userId: req.userId,
+        file: req.file ? {
+          fieldname: req.file.fieldname,
+          mimetype: req.file.mimetype,
+          size: req.file.size
+        } : null,
+        headers: {
+          contentType: req.headers['content-type']
+        }
+      });
+
+      if (!req.file) return errorResponse(res, 400, 'No file uploaded', 'NO_FILE');
+
+      const { chatId, chat_id, type, duration, clientMessageId } = req.body;
+      const rawChatId = chatId || chat_id;
+
+      const chat = await resolveChat(db, req.userId, rawChatId);
+      if (!chat) return errorResponse(res, 400, 'Invalid chatId or recipient', 'INVALID_CHAT_ID');
+      const resolvedChatId = String(chat._id);
+
+      // Deduplicate
+      if (clientMessageId && typeof clientMessageId === 'string') {
+        const existing = await db.collection('messages').findOne({ clientMessageId }, { projection: { _id: 1 } });
+        if (existing) {
+          const sender = await getCachedUser(db, req.userId);
+          const n = normalizeMessage(existing);
+          n.sender = sender;
+          return successResponse(res, { message: n, deduplicated: true });
+        }
+      }
+
+      // Stream upload to Cloudinary
+      const fileType = type || (req.file.mimetype.startsWith('image/') ? 'image' : req.file.mimetype.startsWith('audio/') ? 'voice' : 'video');
+      const resourceType = (fileType === 'voice' || fileType === 'video') ? 'video' : 'image';
+      const folder = `chatflow/${resolvedChatId}`;
+
+      const uploadResult = await new Promise((resolve, reject) => {
+        const uploadStream = cloudinary.uploader.upload_stream(
+          { resource_type: resourceType, folder, format: type === 'voice' ? 'mp3' : undefined },
+          (error, result) => {
+            if (error) reject(error);
+            else resolve(result);
+          }
+        );
+        streamifier.createReadStream(req.file.buffer).pipe(uploadStream);
+      });
+
+      const fileUrl = uploadResult.secure_url;
+      const parsedDuration = parseInt(duration, 10) || Math.round(uploadResult.duration || 0);
+
+      const now = new Date().toISOString();
+      const messageDoc = {
+        chatId: resolvedChatId,
+        senderId: req.userId,
+        content: '',
+        type: type || 'voice',
+        attachments: [{
+          type: type || 'voice',
+          url: fileUrl,
+          size: req.file.size,
+          name: req.file.originalname || 'upload',
+        }],
+        reactions: {},
+        mentions: [],
+        replyTo: null,
+        isEdited: false,
+        isDeleted: false,
+        clientMessageId: clientMessageId || null,
+        status: 'sent',
+        metadata: { duration: parsedDuration, cloudinaryId: uploadResult.public_id },
+        createdAt: now,
+        updatedAt: now,
+      };
+
+      const result = await db.collection('messages').insertOne(messageDoc);
+      messageDoc._id = result.insertedId;
+
+      // Increment unread counts for other participants
+      const incObj = {};
+      (chat.participants || []).forEach(p => {
+        if (String(p) !== req.userId) incObj[`unreadCounts.${p}`] = 1;
+      });
+
+      await db.collection('chats').updateOne(
+        { _id: toObjectId(resolvedChatId) },
+        {
+          $set: {
+            lastMessage: { _id: result.insertedId, content: type === 'voice' ? '🎤 Voice message' : '📎 Attachment', senderId: req.userId, createdAt: now },
+            updatedAt: now,
+          },
+          ...(Object.keys(incObj).length > 0 ? { $inc: incObj } : {}),
+        }
+      );
+
+      const sender = await getCachedUser(db, req.userId);
+      const normalized = normalizeMessage(messageDoc);
+      normalized.sender = sender;
+
+      // Broadcast to chat room and individual users
+      safeEmit(io, `chat:${resolvedChatId}`, 'message:new', buildSocketEvent('message:new', { message: normalized }, { chatId: resolvedChatId, userId: req.userId }));
+      (chat.participants || []).forEach(pid => {
+        if (String(pid) !== req.userId) {
+          safeEmit(io, `user:${pid}`, 'message:new', buildSocketEvent('message:new', { message: normalized }, { chatId: resolvedChatId }));
+        }
+      });
+
+      successResponse(res, { message: normalized }, 201);
+    } catch (err) {
+      console.error('[POST /api/messages/upload] Error:', err.message, err.stack);
+      errorResponse(res, 500, 'Failed to upload and send message', 'UPLOAD_ERROR');
+    }
+  });
+
   app.post('/api/messages/:chatId', auth, async (req, res) => {
     try {
       console.log('[MESSAGE DEBUG]', {
@@ -1401,129 +1525,6 @@ async function startServer() {
       }
       console.error('[POST /api/messages] Error:', err.message);
       errorResponse(res, 500, 'Failed to send message', 'SEND_MESSAGE_ERROR');
-    }
-  });
-
-  // ==========================================================================
-  // FILE UPLOAD ROUTE (Voice, Image, Video via Multer → Cloudinary)
-  // ==========================================================================
-
-  app.post('/api/messages/upload', auth, upload.single('file'), async (req, res) => {
-    try {
-      console.log('[UPLOAD DEBUG]', {
-        body: req.body,
-        chatId: req.body?.chatId,
-        chat_id: req.body?.chat_id,
-        userId: req.userId,
-        file: req.file ? {
-          fieldname: req.file.fieldname,
-          mimetype: req.file.mimetype,
-          size: req.file.size
-        } : null,
-        headers: {
-          contentType: req.headers['content-type']
-        }
-      });
-
-      if (!req.file) return errorResponse(res, 400, 'No file uploaded', 'NO_FILE');
-
-      const { chatId, chat_id, type, duration, clientMessageId } = req.body;
-      const rawChatId = chatId || chat_id;
-
-      const chat = await resolveChat(db, req.userId, rawChatId);
-      if (!chat) return errorResponse(res, 400, 'Invalid chatId or recipient', 'INVALID_CHAT_ID');
-      const resolvedChatId = String(chat._id);
-
-      // Deduplicate
-      if (clientMessageId && typeof clientMessageId === 'string') {
-        const existing = await db.collection('messages').findOne({ clientMessageId }, { projection: { _id: 1 } });
-        if (existing) {
-          const sender = await getCachedUser(db, req.userId);
-          const n = normalizeMessage(existing);
-          n.sender = sender;
-          return successResponse(res, { message: n, deduplicated: true });
-        }
-      }
-
-      // Stream upload to Cloudinary
-      const fileType = type || (req.file.mimetype.startsWith('image/') ? 'image' : req.file.mimetype.startsWith('audio/') ? 'voice' : 'video');
-      const resourceType = (fileType === 'voice' || fileType === 'video') ? 'video' : 'image';
-      const folder = `chatflow/${resolvedChatId}`;
-
-      const uploadResult = await new Promise((resolve, reject) => {
-        const uploadStream = cloudinary.uploader.upload_stream(
-          { resource_type: resourceType, folder, format: type === 'voice' ? 'mp3' : undefined },
-          (error, result) => {
-            if (error) reject(error);
-            else resolve(result);
-          }
-        );
-        streamifier.createReadStream(req.file.buffer).pipe(uploadStream);
-      });
-
-      const fileUrl = uploadResult.secure_url;
-      const parsedDuration = parseInt(duration, 10) || Math.round(uploadResult.duration || 0);
-
-      const now = new Date().toISOString();
-      const messageDoc = {
-        chatId: resolvedChatId,
-        senderId: req.userId,
-        content: '',
-        type: type || 'voice',
-        attachments: [{
-          type: type || 'voice',
-          url: fileUrl,
-          size: req.file.size,
-          name: req.file.originalname || 'upload',
-        }],
-        reactions: {},
-        mentions: [],
-        replyTo: null,
-        isEdited: false,
-        isDeleted: false,
-        clientMessageId: clientMessageId || null,
-        status: 'sent',
-        metadata: { duration: parsedDuration, cloudinaryId: uploadResult.public_id },
-        createdAt: now,
-        updatedAt: now,
-      };
-
-      const result = await db.collection('messages').insertOne(messageDoc);
-      messageDoc._id = result.insertedId;
-
-      // Increment unread counts for other participants
-      const incObj = {};
-      (chat.participants || []).forEach(p => {
-        if (String(p) !== req.userId) incObj[`unreadCounts.${p}`] = 1;
-      });
-
-      await db.collection('chats').updateOne(
-        { _id: toObjectId(resolvedChatId) },
-        {
-          $set: {
-            lastMessage: { _id: result.insertedId, content: type === 'voice' ? '🎤 Voice message' : '📎 Attachment', senderId: req.userId, createdAt: now },
-            updatedAt: now,
-          },
-          ...(Object.keys(incObj).length > 0 ? { $inc: incObj } : {}),
-        }
-      );
-
-      const sender = await getCachedUser(db, req.userId);
-      const normalized = normalizeMessage(messageDoc);
-      normalized.sender = sender;
-
-      // Broadcast to chat room and individual users
-      safeEmit(io, `chat:${resolvedChatId}`, 'message:new', buildSocketEvent('message:new', { message: normalized }, { chatId: resolvedChatId, userId: req.userId }));
-      (chat.participants || []).forEach(pid => {
-        if (String(pid) !== req.userId) {
-          safeEmit(io, `user:${pid}`, 'message:new', buildSocketEvent('message:new', { message: normalized }, { chatId: resolvedChatId }));
-        }
-      });
-
-      successResponse(res, { message: normalized }, 201);
-    } catch (err) {
-      console.error('[POST /api/messages/upload] Error:', err.message, err.stack);
-      errorResponse(res, 500, 'Failed to upload and send message', 'UPLOAD_ERROR');
     }
   });
 
