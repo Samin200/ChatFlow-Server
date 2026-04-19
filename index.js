@@ -1010,7 +1010,7 @@ async function startServer() {
       }
 
       await db.collection('chats').updateOne(
-        { _id: chatObjId },
+        { _id: toObjectId(chatId) },
         { 
           $push: { participants: memberId },
           $set: { [`unreadCounts.${memberId}`]: 0, updatedAt: new Date().toISOString() } 
@@ -1344,7 +1344,8 @@ async function startServer() {
     try {
       if (!req.file) return errorResponse(res, 400, 'No file uploaded', 'NO_FILE');
 
-      const { chatId: rawChatId, type, duration, clientMessageId } = req.body;
+      const { chatId, chat_id, type, duration, clientMessageId } = req.body;
+      const rawChatId = chatId || chat_id;
 
       const chat = await resolveChat(db, req.userId, rawChatId);
       if (!chat) return errorResponse(res, 400, 'Invalid chatId or recipient', 'INVALID_CHAT_ID');
