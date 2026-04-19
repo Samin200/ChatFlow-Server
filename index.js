@@ -216,6 +216,7 @@ function normalizeChat(chat) {
       ? chat.participants.map((p) => (typeof p === 'object' ? normalizeUser(p) : String(p)))
       : [],
     lastMessage: chat.lastMessage ? normalizeMessage(chat.lastMessage) : null,
+    groupRoles: chat.groupRoles || {},
     unreadCount: chat.unreadCount || 0,
     createdAt: chat.createdAt || new Date().toISOString(),
     updatedAt: chat.updatedAt || chat.createdAt || new Date().toISOString(),
@@ -806,6 +807,7 @@ async function startServer() {
         type: type || 'direct',
         name: name ? sanitizeText(name, CONFIG.validation.maxUsernameLength) : null,
         participants: allParticipants,
+        ...(type === 'group' ? { groupRoles: { [req.userId]: 'owner' } } : {}),
         lastMessage: null,
         unreadCounts,
         createdAt: now,
@@ -824,6 +826,170 @@ async function startServer() {
     } catch (err) {
       console.error('[POST /api/chats] Error:', err.message);
       errorResponse(res, 500, 'Failed to create chat', 'CREATE_CHAT_ERROR');
+    }
+  });
+
+  // ADD MEMBER TO GROUP
+  app.post('/api/chats/:chatId/members', auth, async (req, res) => {
+    try {
+      let chatIdStr = req.params.chatId;
+      if (!isValidObjectId(chatIdStr)) return errorResponse(res, 400, 'Invalid chatId', 'INVALID_CHAT_ID');
+      const { memberId } = req.body;
+      if (!isValidObjectId(memberId)) return errorResponse(res, 400, 'Invalid memberId', 'INVALID_USER_ID');
+
+      const chatObjId = toObjectId(chatIdStr);
+      const chat = await db.collection('chats').findOne({ _id: chatObjId, type: 'group' });
+      if (!chat) return errorResponse(res, 404, 'Group not found', 'CHAT_NOT_FOUND');
+
+      const isParticipant = chat.participants.includes(req.userId);
+      const isMemberIdParticipant = chat.participants.includes(memberId);
+
+      if (!isParticipant) return errorResponse(res, 403, 'Not a participant', 'NOT_PARTICIPANT');
+      if (isMemberIdParticipant) return errorResponse(res, 400, 'User is already a member', 'ALREADY_MEMBER');
+
+      // Check admin permissions
+      const role = chat.groupRoles?.[req.userId] || 'member';
+      if (role !== 'admin' && role !== 'owner') {
+        return errorResponse(res, 403, 'Requires admin privileges', 'INSUFFICIENT_PERMISSIONS');
+      }
+
+      await db.collection('chats').updateOne(
+        { _id: chatObjId },
+        { 
+          $push: { participants: memberId },
+          $set: { [`unreadCounts.${memberId}`]: 0, updatedAt: new Date().toISOString() } 
+        }
+      );
+
+      const updatedChat = await db.collection('chats').findOne({ _id: chatObjId });
+      const normalized = normalizeChat(updatedChat);
+      
+      updatedChat.participants.forEach((pid) => {
+        safeEmit(io, `user:${pid}`, 'chat:updated', buildSocketEvent('chat:updated', { chat: normalized }, { chatId: chatIdStr }));
+      });
+
+      successResponse(res, { chat: normalized });
+    } catch (err) {
+      console.error('[POST /api/chats/:chatId/members] Error:', err.message);
+      errorResponse(res, 500, 'Failed to add member', 'ADD_MEMBER_ERROR');
+    }
+  });
+
+  // KICK MEMBER OR LEAVE GROUP
+  app.delete('/api/chats/:chatId/members/:memberId', auth, async (req, res) => {
+    try {
+      const { chatId, memberId } = req.params;
+      if (!isValidObjectId(chatId) || !isValidObjectId(memberId)) return errorResponse(res, 400, 'Invalid ID', 'INVALID_ID');
+
+      const chatObjId = toObjectId(chatId);
+      const chat = await db.collection('chats').findOne({ _id: chatObjId, type: 'group' });
+      if (!chat) return errorResponse(res, 404, 'Group not found', 'CHAT_NOT_FOUND');
+
+      const isSelf = req.userId === memberId;
+      const isParticipant = chat.participants.includes(req.userId);
+      
+      if (!isParticipant && !isSelf) return errorResponse(res, 403, 'Not a participant', 'NOT_PARTICIPANT');
+
+      if (!isSelf) {
+        // Check admin permissions if kicking someone else
+        const myRole = chat.groupRoles?.[req.userId] || 'member';
+        const targetRole = chat.groupRoles?.[memberId] || 'member';
+
+        if (myRole !== 'admin' && myRole !== 'owner') {
+          return errorResponse(res, 403, 'Requires admin privileges', 'INSUFFICIENT_PERMISSIONS');
+        }
+        if (myRole === 'admin' && (targetRole === 'admin' || targetRole === 'owner')) {
+          return errorResponse(res, 403, 'Admin cannot kick another Admin/Owner', 'INSUFFICIENT_PERMISSIONS');
+        }
+      }
+
+      const updateQuery = {
+        $pull: { participants: memberId },
+        $unset: { [`groupRoles.${memberId}`]: "" },
+        $set: { updatedAt: new Date().toISOString() }
+      };
+
+      await db.collection('chats').updateOne({ _id: chatObjId }, updateQuery);
+      
+      const updatedChat = await db.collection('chats').findOne({ _id: chatObjId });
+      
+      // If no members left, delete the group
+      if (updatedChat.participants.length === 0) {
+        await db.collection('chats').deleteOne({ _id: chatObjId });
+        await db.collection('messages').deleteMany({ chatId });
+        successResponse(res, { deleted: true });
+        return;
+      }
+      
+      // Assign new owner if owner leaves
+      if (isSelf && chat.groupRoles?.[req.userId] === 'owner') {
+        const remainingAdmin = updatedChat.participants.find(p => updatedChat.groupRoles?.[p] === 'admin');
+        const newOwner = remainingAdmin || updatedChat.participants[0];
+        await db.collection('chats').updateOne({ _id: chatObjId }, { $set: { [`groupRoles.${newOwner}`]: 'owner' } });
+      }
+
+      const freshChat = await db.collection('chats').findOne({ _id: chatObjId });
+      const normalized = normalizeChat(freshChat);
+      
+      // Notify kicked member they were removed
+      if (!isSelf) {
+        safeEmit(io, `user:${memberId}`, 'group:kicked', buildSocketEvent('group:kicked', { chatId }));
+      }
+      
+      // Notify remaining members
+      freshChat.participants.forEach((pid) => {
+        safeEmit(io, `user:${pid}`, 'chat:updated', buildSocketEvent('chat:updated', { chat: normalized }, { chatId }));
+      });
+      
+      successResponse(res, { chat: normalized });
+    } catch (err) {
+      console.error('[DELETE /api/chats/:chatId/members/:memberId] Error:', err.message);
+      errorResponse(res, 500, 'Failed to remove member', 'REMOVE_MEMBER_ERROR');
+    }
+  });
+
+  // CHANGE MEMBER ROLE
+  app.put('/api/chats/:chatId/members/:memberId/role', auth, async (req, res) => {
+    try {
+        const { chatId, memberId } = req.params;
+        const { role } = req.body; // 'admin' or 'member'
+        
+        if (!isValidObjectId(chatId) || !isValidObjectId(memberId)) return errorResponse(res, 400, 'Invalid ID', 'INVALID_ID');
+        if (role !== 'admin' && role !== 'member') return errorResponse(res, 400, 'Invalid role', 'INVALID_ROLE');
+  
+        const chatObjId = toObjectId(chatId);
+        const chat = await db.collection('chats').findOne({ _id: chatObjId, type: 'group' });
+        if (!chat) return errorResponse(res, 404, 'Group not found', 'CHAT_NOT_FOUND');
+  
+        const myRole = chat.groupRoles?.[req.userId] || 'member';
+        const targetRole = chat.groupRoles?.[memberId] || 'member';
+
+        // Only Owner can promote/demote admins
+        if (myRole !== 'owner') {
+          return errorResponse(res, 403, 'Only the group owner can change admin roles', 'INSUFFICIENT_PERMISSIONS');
+        }
+        if (targetRole === 'owner') {
+          return errorResponse(res, 400, 'Cannot change owner role', 'INVALID_OPERATION');
+        }
+
+        const updateKey = `groupRoles.${memberId}`;
+        const updateDoc = role === 'member'
+          ? { $unset: { [updateKey]: "" }, $set: { updatedAt: new Date().toISOString() } }
+          : { $set: { [updateKey]: role, updatedAt: new Date().toISOString() } };
+
+        await db.collection('chats').updateOne({ _id: chatObjId }, updateDoc);
+  
+        const updatedChat = await db.collection('chats').findOne({ _id: chatObjId });
+        const normalized = normalizeChat(updatedChat);
+        
+        updatedChat.participants.forEach((pid) => {
+          safeEmit(io, `user:${pid}`, 'chat:updated', buildSocketEvent('chat:updated', { chat: normalized }, { chatId }));
+        });
+  
+        successResponse(res, { chat: normalized });
+    } catch (err) {
+      console.error('[PUT role] Error:', err.message);
+      errorResponse(res, 500, 'Failed to update user role', 'ROLE_UPDATE_ERROR');
     }
   });
 
@@ -1366,6 +1532,42 @@ async function startServer() {
       } catch {}
     });
 
+    // --- WebRTC Signaling ---
+    socket.on('call:invite', (data) => {
+      if (data?.targetId) {
+        socket.to(`user:${data.targetId}`).emit('call:invite', { ...data, callerId: userId });
+      } else if (data?.chatId) {
+        socket.to(`chat:${data.chatId}`).emit('call:invite', { ...data, callerId: userId });
+      }
+    });
+
+    socket.on('call:accepted', (data) => {
+      if (data?.targetId) {
+        socket.to(`user:${data.targetId}`).emit('call:accepted', { ...data, responderId: userId });
+      }
+    });
+
+    socket.on('call:rejected', (data) => {
+      if (data?.targetId) {
+        socket.to(`user:${data.targetId}`).emit('call:rejected', { ...data, responderId: userId });
+      }
+    });
+
+    socket.on('call:ice-candidate', (data) => {
+      if (data?.targetId) {
+        socket.to(`user:${data.targetId}`).emit('call:ice-candidate', { ...data, senderId: userId });
+      }
+    });
+
+    socket.on('call:ended', (data) => {
+      if (data?.targetId) {
+        socket.to(`user:${data.targetId}`).emit('call:ended', { ...data, enderId: userId });
+      } else if (data?.chatId) {
+        socket.to(`chat:${data.chatId}`).emit('call:ended', { ...data, enderId: userId });
+      }
+    });
+    // -------------------------
+
     socket.on('message:read', async (data) => {
       try {
         const chatId = ensureChatIdString(data?.chatId);
@@ -1433,3 +1635,8 @@ async function startServer() {
   process.on('SIGTERM', shutdown);
   process.on('SIGINT', shutdown);
 }
+
+startServer().catch((err) => {
+  console.error('[FATAL] Startup Error:', err.message);
+  process.exit(1);
+});
