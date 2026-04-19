@@ -202,24 +202,43 @@ async function getOrCreateDirectChat(db, userAId, userBId) {
 
 async function resolveChat(db, currentUserId, idOrUserId) {
   if (!idOrUserId) return null;
-  const idStr = String(idOrUserId);
-  const objId = toObjectId(idStr);
-  if (!objId) return null;
-
-  // 1. Check if it's an existing Chat
-  const chat = await db.collection('chats').findOne({
-    _id: objId,
-    participants: String(currentUserId)
+  
+  const idStr = String(idOrUserId).trim();
+  if (!isValidObjectId(idStr)) return null;
+  
+  // Try as a direct chat ID first
+  const directChat = await db.collection('chats').findOne({
+    _id: toObjectId(idStr),
+    participants: currentUserId
   });
-  if (chat) return chat;
-
-  // 2. Check if it's a User ID for a direct chat
-  const otherUser = await db.collection('users').findOne({ _id: objId }, { projection: { _id: 1 } });
-  if (otherUser) {
-    return await getOrCreateDirectChat(db, currentUserId, idStr);
-  }
-
-  return null;
+  if (directChat) return directChat;
+  
+  // Try as a user ID — find existing direct chat between the two users
+  const userChat = await db.collection('chats').findOne({
+    type: 'direct',
+    participants: { $all: [currentUserId, idStr], $size: 2 }
+  });
+  if (userChat) return userChat;
+  
+  // Create a new direct chat between the two users
+  const targetUser = await db.collection('users').findOne(
+    { _id: toObjectId(idStr) },
+    { projection: { _id: 1 } }
+  );
+  if (!targetUser) return null;
+  
+  const now = new Date().toISOString();
+  const newChat = {
+    type: 'direct',
+    participants: [currentUserId, idStr],
+    unreadCounts: {},
+    createdAt: now,
+    updatedAt: now
+  };
+  
+  const result = await db.collection('chats').insertOne(newChat);
+  newChat._id = result.insertedId;
+  return newChat;
 }
 
 function ensureChatIdString(chatId) {
