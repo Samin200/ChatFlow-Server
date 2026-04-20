@@ -1,5 +1,5 @@
 {
-  "name": "kothaboli-server",
+  "name": "novalink-server",
   "version": "1.0.0",
   "private": true,
   "main": "index.js",
@@ -17,6 +17,7 @@
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
     "jsonwebtoken": "^9.0.2",
+    "livekit-server-sdk": "^2.15.1",
     "mongodb": "^6.8.0",
     "multer": "^2.1.1",
     "socket.io": "^4.8.0",

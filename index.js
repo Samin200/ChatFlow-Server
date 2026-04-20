@@ -1,5 +1,5 @@
 // ============================================================================
-// KothaBolbi Backend — Production-Ready Single-File Architecture
+// NovaLink Backend — Production-Ready Single-File Architecture
 // Express + Socket.IO + MongoDB (Native Driver)
 // Version: 2.0.1
 // ============================================================================
@@ -54,6 +54,7 @@ const streamifier = require('streamifier');
 const webpush = require('web-push');
 const axios = require('axios');
 const cheerio = require('cheerio');
+const { AccessToken } = require('livekit-server-sdk');
 
 const SALT_ROUNDS = 10;
 
@@ -91,7 +92,7 @@ const upload = multer({
 const CONFIG = {
   port: process.env.PORT || 3001,
   mongoUri: process.env.MONGODB_URI,
-  dbName: process.env.DB_NAME || 'kothaboli',
+  dbName: process.env.DB_NAME || 'novalink',
   cors: {
     origin: process.env.CLIENT_URL || 'http://localhost:5173',
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH'],
@@ -309,7 +310,7 @@ async function getLinkPreview(db, url) {
 
     const { data: html } = await axios.get(url, {
       timeout: 5000,
-      headers: { 'User-Agent': 'KothaBolbi-Bot/1.0' }
+      headers: { 'User-Agent': 'NovaLink-Bot/1.0' }
     });
     const $ = cheerio.load(html);
 
@@ -904,14 +905,52 @@ async function startServer() {
   // SECTION 11b: HEALTH
   // ==========================================================================
 
-  app.get('/api/health', (req, res) => {
-    res.json({
-      status: 'ok',
-      mongodb: MONGODB_STATUS,
-      vapid: VAPID_STATUS,
-      cloudinary: CLOUDINARY_STATUS,
-      uptime: Math.floor(process.uptime()),
     });
+  });
+
+  // ==========================================================================
+  // SECTION 11d: LIVEKIT
+  // ==========================================================================
+
+  app.post('/api/livekit/token', auth, async (req, res) => {
+    try {
+      const { roomName, identity } = req.body;
+      if (!roomName || !identity) {
+        return errorResponse(res, 400, 'roomName and identity required', 'MISSING_PARAMS');
+      }
+
+      if (!process.env.LIVEKIT_API_KEY || !process.env.LIVEKIT_API_SECRET || !process.env.LIVEKIT_URL) {
+        return errorResponse(res, 500, 'LiveKit configuration missing', 'LIVEKIT_CONFIG_MISSING');
+      }
+
+      const at = new AccessToken(
+        process.env.LIVEKIT_API_KEY,
+        process.env.LIVEKIT_API_SECRET,
+        {
+          identity: identity,
+          name: identity,
+          ttl: '60m',
+        }
+      );
+
+      at.addGrant({
+        roomJoin: true,
+        room: roomName,
+        canPublish: true,
+        canSubscribe: true,
+      });
+
+      const token = await at.toJwt();
+
+      successResponse(res, {
+        serverUrl: process.env.LIVEKIT_URL,
+        token: token,
+        roomName: roomName
+      });
+    } catch (error) {
+      console.error('[POST /api/livekit/token] Error:', error.message);
+      errorResponse(res, 500, 'Failed to generate token', 'TOKEN_GEN_ERROR');
+    }
   });
 
   // ==========================================================================
@@ -1322,7 +1361,7 @@ async function startServer() {
 
       if (!req.file) return errorResponse(res, 400, 'No file uploaded', 'NO_FILE');
 
-      const { chatId, chat_id, type, duration, clientMessageId } = req.body;
+      const { chatId, chat_id, type, duration, clientMessageId, replyTo } = req.body;
       const rawChatId = chatId || chat_id;
 
       const chat = await resolveChat(db, req.userId, rawChatId);
@@ -1343,7 +1382,7 @@ async function startServer() {
       // Stream upload to Cloudinary
       const fileType = type || (req.file.mimetype.startsWith('image/') ? 'image' : req.file.mimetype.startsWith('audio/') ? 'voice' : 'video');
       const resourceType = (fileType === 'voice' || fileType === 'video') ? 'video' : 'image';
-      const folder = `kothaboli/${resolvedChatId}`;
+      const folder = `novalink/${resolvedChatId}`;
 
       const uploadResult = await new Promise((resolve, reject) => {
         const uploadStream = cloudinary.uploader.upload_stream(
@@ -1373,7 +1412,7 @@ async function startServer() {
         }],
         reactions: {},
         mentions: [],
-        replyTo: null,
+        replyTo: replyTo || null,
         isEdited: false,
         isDeleted: false,
         clientMessageId: clientMessageId || null,
@@ -1845,65 +1884,66 @@ async function startServer() {
       } catch {}
     });
 
-    // --- WebRTC Signaling ---
-    socket.on('call:invite', async (data) => {
-      if (data?.targetId) {
-        // Track the caller
-        activeCalls.set(socket.id, { callId: data.callId, otherId: data.targetId, role: 'caller' });
-        
-        socket.to(`user:${data.targetId}`).emit('call:invite', { ...data, callerId: userId });
-        
-        // Push notification for call
-        sendPushNotification(db, data.targetId, {
-          title: `Incoming ${data.isVideo ? 'Video' : 'Voice'} Call`,
-          body: `${username} is calling you...`,
-          tag: `call_${data.callId}`,
-          data: { type: 'call', callId: data.callId, callerId: userId }
+    // --- LiveKit Call Signaling ---
+    socket.on('start-call', (data) => {
+      try {
+        const { to, chatId } = data;
+        const callId = `call_${Date.now()}`;
+        const roomName = `room_${chatId}_${Date.now()}`;
+
+        activeCalls.set(socket.id, { callId, otherId: to, chatId, roomName, role: 'caller' });
+
+        io.to(`user:${to}`).emit('incoming-call', {
+          from: socket.userId,
+          callerName: socket.username,
+          chatId,
+          callId,
+          roomName
         });
-      } else if (data?.chatId) {
-        socket.to(`chat:${data.chatId}`).emit('call:invite', { ...data, callerId: userId });
+
+        // Push notification
+        sendPushNotification(db, to, {
+          title: `Incoming Voice Call`,
+          body: `${socket.username} is calling you...`,
+          tag: `call_${callId}`,
+          data: { type: 'call', callId, from: socket.userId, chatId, roomName }
+        });
+      } catch (err) {
+        console.error('[Socket] start-call error:', err.message);
       }
     });
 
-    socket.on('call:accepted', (data) => {
-      if (data?.targetId) {
-        // Track the recipient too (targetId here is the caller)
-        activeCalls.set(socket.id, { callId: data.callId, otherId: data.targetId, role: 'recipient' });
-        socket.to(`user:${data.targetId}`).emit('call:accepted', { ...data, responderId: userId });
+    socket.on('accept-call', (data) => {
+      try {
+        const { from, chatId, roomName, callId } = data;
+        activeCalls.set(socket.id, { callId, otherId: from, chatId, roomName, role: 'recipient' });
+        io.to(`user:${from}`).emit('call-accepted', data);
+      } catch (err) {
+        console.error('[Socket] accept-call error:', err.message);
       }
     });
 
-    socket.on('call:rejected', (data) => {
-      if (data?.targetId) {
-        // Cleanup the call for both participants
+    socket.on('reject-call', (data) => {
+      try {
+        const { from, callId } = data;
         for (const [sid, call] of activeCalls.entries()) {
-          if (call.callId === data.callId) activeCalls.delete(sid);
+          if (call.callId === callId) activeCalls.delete(sid);
         }
-        socket.to(`user:${data.targetId}`).emit('call:rejected', { ...data, responderId: userId });
+        io.to(`user:${from}`).emit('call-rejected', data);
+      } catch (err) {
+        console.error('[Socket] reject-call error:', err.message);
       }
     });
 
-    socket.on('call:ice-candidate', (data) => {
-      if (data?.targetId) {
-        socket.to(`user:${data.targetId}`).emit('call:ice-candidate', { ...data, senderId: userId });
-      }
-    });
-
-    socket.on('call:ended', (data) => {
-      const callData = activeCalls.get(socket.id);
-      const callIdToRemove = data.callId || callData?.callId;
-      
-      // Cleanup both sides from the Map
-      if (callIdToRemove) {
+    socket.on('end-call', (data) => {
+      try {
+        const { otherUserId, callId, chatId } = data;
         for (const [sid, call] of activeCalls.entries()) {
-          if (call.callId === callIdToRemove) activeCalls.delete(sid);
+          if (call.callId === callId) activeCalls.delete(sid);
         }
-      }
-
-      if (data?.targetId) {
-        socket.to(`user:${data.targetId}`).emit('call:ended', { ...data, enderId: userId });
-      } else if (data?.chatId) {
-        socket.to(`chat:${data.chatId}`).emit('call:ended', { ...data, enderId: userId });
+        io.to(`user:${otherUserId}`).emit('call-ended', { callId, chatId });
+      } catch (err) {
+        console.error('[Socket] end-call error:', err.message);
       }
     });
     // -------------------------
@@ -1927,10 +1967,10 @@ async function startServer() {
     socket.on('disconnect', (reason) => {
       console.log(`[Socket] Disconnected: ${username} (${userId}) — ${reason}`);
       
-      // Auto-end WebRTC call if exists
+      // Auto-end call if exists
       if (activeCalls.has(socket.id)) {
-        const { callId, otherId } = activeCalls.get(socket.id);
-        socket.to(`user:${otherId}`).emit('call:ended', { callId, enderId: userId, reason: 'disconnected' });
+        const { callId, otherId, chatId } = activeCalls.get(socket.id);
+        socket.to(`user:${otherId}`).emit('call-ended', { callId, chatId, enderId: userId, reason: 'disconnected' });
         
         // Cleanup all Map entries related to this callId
         for (const [sid, call] of activeCalls.entries()) {
@@ -1968,7 +2008,7 @@ async function startServer() {
   httpServer.listen(CONFIG.port, () => {
     console.log(`
 +-----------------------------------------------------+
-|         KothaBolbi API v2 is Running                |
+|           NovaLink API v2 is Running                |
 +-----------------------------------------------------+
 |  HTTP  ->  http://localhost:${CONFIG.port}                  |
 |  WS    ->  ws://localhost:${CONFIG.port}                    |
@@ -1979,7 +2019,7 @@ async function startServer() {
   });
 
   const shutdown = async () => {
-    console.log('[KothaBolbi] Shutting down...');
+    console.log('[NovaLink] Shutting down...');
     io.close();
     await mongoClient.close();
     process.exit(0);
