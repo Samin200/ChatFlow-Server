@@ -1,5 +1,5 @@
 // ============================================================================
-// NovaLink Backend — Production-Ready Single-File Architecture
+// ChatFlow Backend — Production-Ready Single-File Architecture
 // Express + Socket.IO + MongoDB (Native Driver)
 // Version: 2.0.1
 // ============================================================================
@@ -92,7 +92,7 @@ const upload = multer({
 const CONFIG = {
   port: process.env.PORT || 3001,
   mongoUri: process.env.MONGODB_URI,
-  dbName: process.env.DB_NAME || 'novalink',
+  dbName: process.env.DB_NAME || 'chatflow',
   cors: {
     origin: process.env.CLIENT_URL || 'http://localhost:5173',
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH'],
@@ -310,7 +310,7 @@ async function getLinkPreview(db, url) {
 
     const { data: html } = await axios.get(url, {
       timeout: 5000,
-      headers: { 'User-Agent': 'NovaLink-Bot/1.0' }
+      headers: { 'User-Agent': 'ChatFlow-Bot/1.0' }
     });
     const $ = cheerio.load(html);
 
@@ -905,6 +905,13 @@ async function startServer() {
   // SECTION 11b: HEALTH
   // ==========================================================================
 
+  app.get('/api/health', (req, res) => {
+    res.json({
+      status: 'ok',
+      mongodb: MONGODB_STATUS,
+      vapid: VAPID_STATUS,
+      cloudinary: CLOUDINARY_STATUS,
+      uptime: Math.floor(process.uptime()),
     });
   });
 
@@ -1382,7 +1389,7 @@ async function startServer() {
       // Stream upload to Cloudinary
       const fileType = type || (req.file.mimetype.startsWith('image/') ? 'image' : req.file.mimetype.startsWith('audio/') ? 'voice' : 'video');
       const resourceType = (fileType === 'voice' || fileType === 'video') ? 'video' : 'image';
-      const folder = `novalink/${resolvedChatId}`;
+      const folder = `chatflow/${resolvedChatId}`;
 
       const uploadResult = await new Promise((resolve, reject) => {
         const uploadStream = cloudinary.uploader.upload_stream(
@@ -2008,7 +2015,7 @@ async function startServer() {
   httpServer.listen(CONFIG.port, () => {
     console.log(`
 +-----------------------------------------------------+
-|           NovaLink API v2 is Running                |
+|           ChatFlow API v3 is Running                |
 +-----------------------------------------------------+
 |  HTTP  ->  http://localhost:${CONFIG.port}                  |
 |  WS    ->  ws://localhost:${CONFIG.port}                    |
@@ -2019,7 +2026,7 @@ async function startServer() {
   });
 
   const shutdown = async () => {
-    console.log('[NovaLink] Shutting down...');
+    console.log('[ChatFlow] Shutting down...');
     io.close();
     await mongoClient.close();
     process.exit(0);
