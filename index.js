@@ -1906,17 +1906,14 @@ async function startServer() {
     // --- LiveKit Call Signaling ---
     socket.on('start-call', async (data) => {
       try {
-        const { to: manualTo, chatId } = data;
-        const chat = await db.collection('chats').findOne({ _id: toObjectId(chatId) }, { projection: { participants: 1 } });
-        if (!chat) return;
-
-        const to = manualTo || chat.participants.find((id) => String(id) !== String(userId));
-        console.log(`[Call] start-call from ${userId} to ${to} (manual: ${manualTo})`);
+        const { to, chatId } = data;
         
-        if (!to) {
-          console.warn(`[Call] No recipient found for call in chat ${chatId}`);
+        if (!to || !chatId) {
+          console.warn(`[Call] Missing to or chatId in start-call:`, data);
           return;
         }
+        
+        console.log(`[Call] start-call from ${userId} to ${to}, chatId=${chatId}`);
         
         const callId = `call_${Date.now()}`;
         const roomName = `room_${chatId}_${Date.now()}`;
@@ -1931,8 +1928,11 @@ async function startServer() {
           roomName
         };
 
-        console.log(`[Call] Emitting incoming-call to user:${to}`);
-        io.to(`user:${to}`).emit('incoming-call', payload);
+        const targetRoom = `user:${to}`;
+        const socketsInRoom = io.sockets.adapter.rooms.get(targetRoom);
+        console.log(`[Call] Room ${targetRoom} has ${socketsInRoom ? socketsInRoom.size : 0} socket(s)`);
+        
+        io.to(targetRoom).emit('incoming-call', payload);
         socket.emit('call-started', payload);
 
         // Push notification
