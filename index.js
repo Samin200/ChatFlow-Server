@@ -1899,7 +1899,13 @@ async function startServer() {
         if (!chat) return;
 
         const to = manualTo || chat.participants.find((id) => String(id) !== String(userId));
-        if (!to) return;
+        console.log(`[Call] start-call from ${userId} to ${to} (manual: ${manualTo})`);
+        
+        if (!to) {
+          console.warn(`[Call] No recipient found for call in chat ${chatId}`);
+          return;
+        }
+        
         const callId = `call_${Date.now()}`;
         const roomName = `room_${chatId}_${Date.now()}`;
 
@@ -1913,6 +1919,7 @@ async function startServer() {
           roomName
         };
 
+        console.log(`[Call] Emitting incoming-call to user:${to}`);
         io.to(`user:${to}`).emit('incoming-call', payload);
         socket.emit('call-started', payload);
 
