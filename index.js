@@ -1846,9 +1846,21 @@ async function startServer() {
 
   io.on('connection', async (socket) => {
     const { userId, username } = socket;
+    socket.join(`user:${userId}`);
     console.log(`[Socket] Connected: ${username} (${userId}) — ${socket.id}`);
 
-    socket.join(`user:${userId}`);
+    // Re-authenticate / join room explicitly if requested
+    socket.on('authenticate', (authUserId) => {
+      try {
+        if (authUserId) {
+          socket.userId = String(authUserId);
+          socket.join(`user:${authUserId}`);
+          console.log(`[Socket] User ${authUserId} authenticated and joined room`);
+        }
+      } catch (err) {
+        console.error('[Socket] Authenticate error:', err.message);
+      }
+    });
 
     try {
       const chats = await db.collection('chats').find({ participants: userId }, { projection: { _id: 1, participants: 1 } }).toArray();
