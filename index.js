@@ -92,7 +92,7 @@ const upload = multer({
 const CONFIG = {
   port: process.env.PORT || 3001,
   mongoUri: process.env.MONGODB_URI,
-  dbName: process.env.DB_NAME || 'chatflow',
+  dbName: process.env.DB_NAME || 'novalink',
   cors: {
     origin: process.env.CLIENT_URL || 'http://localhost:5173',
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH'],
