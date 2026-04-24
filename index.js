@@ -1892,7 +1892,7 @@ async function startServer() {
     });
 
     // --- LiveKit Call Signaling ---
-    socket.on('start-call', (data) => {
+    socket.on('start-call', async (data) => {
       try {
         const { to: manualTo, chatId } = data;
         const chat = await db.collection('chats').findOne({ _id: toObjectId(chatId) }, { projection: { participants: 1 } });
