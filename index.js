@@ -1894,19 +1894,27 @@ async function startServer() {
     // --- LiveKit Call Signaling ---
     socket.on('start-call', (data) => {
       try {
-        const { to, chatId } = data;
+        const { to: manualTo, chatId } = data;
+        const chat = await db.collection('chats').findOne({ _id: toObjectId(chatId) }, { projection: { participants: 1 } });
+        if (!chat) return;
+
+        const to = manualTo || chat.participants.find((id) => String(id) !== String(userId));
+        if (!to) return;
         const callId = `call_${Date.now()}`;
         const roomName = `room_${chatId}_${Date.now()}`;
 
         activeCalls.set(socket.id, { callId, otherId: to, chatId, roomName, role: 'caller' });
 
-        io.to(`user:${to}`).emit('incoming-call', {
+        const payload = {
           from: socket.userId,
           callerName: socket.username,
           chatId,
           callId,
           roomName
-        });
+        };
+
+        io.to(`user:${to}`).emit('incoming-call', payload);
+        socket.emit('call-started', payload);
 
         // Push notification
         sendPushNotification(db, to, {
