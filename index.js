@@ -1974,7 +1974,8 @@ async function startServer() {
             });
           });
           
-          socket.emit('call-started', payload);
+          activeCalls.set(socket.id, { callId, chatId, roomName, role: 'caller', isVideo, isGroup: true, startTime: Date.now() });
+          socket.emit('call-started', { ...payload, isGroup: true });
           console.log(`[Call] start-call (group): ${socket.userId} -> Group ${chatId}`);
         } else {
           // Direct Call logic
@@ -1988,7 +1989,7 @@ async function startServer() {
           if (socketCount === 0) {
             socket.emit('call-failed', { reason: 'recipient_offline' });
           } else {
-            activeCalls.set(socket.id, { callId, otherId: to, chatId, roomName, role: 'caller', isVideo });
+            activeCalls.set(socket.id, { callId, otherId: to, chatId, roomName, role: 'caller', isVideo, startTime: Date.now() });
             io.to(targetRoom).emit('incoming-call', payload);
             socket.emit('call-started', payload);
 
@@ -2027,6 +2028,7 @@ async function startServer() {
           }
         }
 
+        activeCalls.set(socket.id, { callId, otherId: from, chatId, roomName, role: 'recipient', isVideo: data.isVideo, startTime: Date.now() });
         io.to(`user:${from}`).emit('call-accepted', data);
       } catch (err) {
         console.error('[Socket] accept-call error:', err.message);
