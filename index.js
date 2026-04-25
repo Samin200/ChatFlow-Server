@@ -55,6 +55,7 @@ const webpush = require('web-push');
 const axios = require('axios');
 const cheerio = require('cheerio');
 const { AccessToken } = require('livekit-server-sdk');
+const helmet = require('helmet');
 
 const SALT_ROUNDS = 10;
 
@@ -726,6 +727,19 @@ async function startServer() {
 
   const app = express();
   const httpServer = createServer(app);
+
+  // Use helmet but configure it to allow your external assets (Cloudinary/LiveKit)
+  app.use(helmet({
+    contentSecurityPolicy: {
+      directives: {
+        "default-src": ["'self'"],
+        "script-src": ["'self'", "'unsafe-inline'"],
+        "style-src": ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com"],
+        "img-src": ["'self'", "data:", "https://res.cloudinary.com", "https://api.dicebear.com"],
+        "connect-src": ["'self'", "wss://*.livekit.cloud", "https://*.livekit.cloud", "ws://localhost:3001"],
+      },
+    },
+  }));
 
   app.use(express.json({ limit: CONFIG.validation.maxPayloadSize }));
 
