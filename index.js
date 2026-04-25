@@ -1855,7 +1855,8 @@ async function startServer() {
         if (authUserId) {
           socket.userId = String(authUserId);
           socket.join(`user:${authUserId}`);
-          console.log(`[Socket] User ${authUserId} authenticated and joined room`);
+          const rooms = Array.from(socket.rooms);
+          console.log(`[DEBUG-SOCKET] User ${authUserId} authenticated. Current rooms:`, rooms);
         }
       } catch (err) {
         console.error('[Socket] Authenticate error:', err.message);
@@ -1907,13 +1908,16 @@ async function startServer() {
     socket.on('start-call', async (data) => {
       try {
         const { to, chatId } = data;
+        console.log(`[DEBUG-CALL] start-call payload received:`, data);
         
         if (!to || !chatId) {
-          console.warn(`[Call] Missing to or chatId in start-call:`, data);
+          console.warn(`[DEBUG-CALL] ERROR: Missing to or chatId:`, data);
           return;
         }
         
-        console.log(`[Call] start-call from ${userId} to ${to}, chatId=${chatId}`);
+        const targetRoom = `user:${to}`;
+        const socketsInRoom = io.sockets.adapter.rooms.get(targetRoom);
+        console.log(`[DEBUG-CALL] Recipient ${to} is in room ${targetRoom}. Active sockets: ${socketsInRoom ? socketsInRoom.size : 0}`);
         
         const callId = `call_${Date.now()}`;
         const roomName = `room_${chatId}_${Date.now()}`;
@@ -1928,10 +1932,7 @@ async function startServer() {
           roomName
         };
 
-        const targetRoom = `user:${to}`;
-        const socketsInRoom = io.sockets.adapter.rooms.get(targetRoom);
-        console.log(`[Call] Room ${targetRoom} has ${socketsInRoom ? socketsInRoom.size : 0} socket(s)`);
-        
+        console.log(`[DEBUG-CALL] Emitting 'incoming-call' to room ${targetRoom}`);
         io.to(targetRoom).emit('incoming-call', payload);
         socket.emit('call-started', payload);
 
