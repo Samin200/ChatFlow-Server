@@ -1933,52 +1933,69 @@ async function startServer() {
     // --- LiveKit Call Signaling ---
     socket.on('start-call', async (data) => {
       try {
-        const { to, chatId } = data;
-        if (!to || !chatId) return;
+        const { to, chatId, isVideo } = data;
+        if (!chatId) return;
+
+        // Fetch chat to check if it's a group
+        const chat = await db.collection('chats').findOne({ _id: isValidObjectId(chatId) ? new ObjectId(chatId) : chatId });
+        const isGroup = chat && chat.type === 'group';
 
         const callId = `call_${Date.now()}`;
-        const roomName = `call_${chatId}_${Date.now()}`;
+        const roomName = isGroup ? `group_call_${chatId}` : `call_${chatId}_${Date.now()}`;
 
         const payload = {
           from: socket.userId,
           callerName: socket.username || 'Someone',
           chatId,
           callId,
-          roomName
+          roomName,
+          isVideo: Boolean(isVideo),
+          isGroup
         };
 
-        const targetRoom = `user:${to}`;
-        const roomSockets = io.sockets.adapter.rooms.get(targetRoom);
-        const socketCount = roomSockets ? roomSockets.size : 0;
+        if (isGroup) {
+          // Broadcast to all participants except self
+          const members = chat.participants || [];
+          const otherMembers = members.filter(m => String(m.id || m) !== String(socket.userId));
+          
+          otherMembers.forEach(memberId => {
+            const mid = String(memberId.id || memberId);
+            io.to(`user:${mid}`).emit('incoming-call', payload);
+            
+            sendPushNotification(db, mid, {
+              title: `Incoming ${isVideo ? 'Video' : 'Voice'} Call`,
+              body: `${socket.username || 'Someone'} is calling the group ${chat.name || ''}`,
+              tag: `call_${callId}`,
+              data: { type: 'call', callId, from: socket.userId, chatId, roomName, isVideo }
+            });
+          });
+          
+          socket.emit('call-started', payload);
+          console.log(`[Call] start-call (group): ${socket.userId} -> Group ${chatId}`);
+        } else {
+          // Direct Call logic
+          if (!to) return;
+          const targetRoom = `user:${to}`;
+          const roomSockets = io.sockets.adapter.rooms.get(targetRoom);
+          const socketCount = roomSockets ? roomSockets.size : 0;
 
-        console.log(`[Call] start-call: ${socket.userId} -> ${to} | Room ${targetRoom} has ${socketCount} socket(s)`);
+          console.log(`[Call] start-call (direct): ${socket.userId} -> ${to} | isVideo: ${isVideo}`);
 
-        if (socketCount === 0) {
-          console.warn(`[Call] WARNING: User ${to} has NO sockets in room ${targetRoom}`);
-          socket.emit('call-failed', { reason: 'recipient_offline' });
-          // Still try push notification
+          if (socketCount === 0) {
+            socket.emit('call-failed', { reason: 'recipient_offline' });
+          } else {
+            activeCalls.set(socket.id, { callId, otherId: to, chatId, roomName, role: 'caller', isVideo });
+            io.to(targetRoom).emit('incoming-call', payload);
+            socket.emit('call-started', payload);
+          }
+
           sendPushNotification(db, to, {
-            title: 'Incoming Voice Call',
+            title: `Incoming ${isVideo ? 'Video' : 'Voice'} Call`,
             body: `${socket.username || 'Someone'} is calling you...`,
             tag: `call_${callId}`,
-            data: { type: 'call', callId, from: socket.userId, chatId, roomName }
+            data: { type: 'call', callId, from: socket.userId, chatId, roomName, isVideo }
           });
-          return;
         }
-
-        activeCalls.set(socket.id, { callId, otherId: to, chatId, roomName, role: 'caller' });
-
-        io.to(targetRoom).emit('incoming-call', payload);
-        console.log(`[Call] Emitted incoming-call to ${to} (${socketCount} socket(s))`);
-
-        socket.emit('call-started', payload);
-
-        sendPushNotification(db, to, {
-          title: 'Incoming Voice Call',
-          body: `${socket.username || 'Someone'} is calling you...`,
-          tag: `call_${callId}`,
-          data: { type: 'call', callId, from: socket.userId, chatId, roomName }
-        });
       } catch (err) {
         console.error('[Call] start-call error:', err.message);
       }
@@ -2020,7 +2037,11 @@ async function startServer() {
         for (const [sid, call] of activeCalls.entries()) {
           if (call.callId === callId) activeCalls.delete(sid);
         }
-        io.to(`user:${otherUserId}`).emit('call-ended', { callId, chatId });
+        
+        if (otherUserId) {
+          io.to(`user:${otherUserId}`).emit('call-ended', { callId, chatId });
+          console.log(`[Call] end-call: ${socket.userId} -> ${otherUserId}`);
+        }
 
         // Update call log in DB
         const callInfo = activeCalls.get(socket.id);
