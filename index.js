@@ -1855,8 +1855,12 @@ async function startServer() {
         if (authUserId) {
           socket.userId = String(authUserId);
           socket.join(`user:${authUserId}`);
-          const rooms = Array.from(socket.rooms);
-          console.log(`[DEBUG-SOCKET] User ${authUserId} authenticated. Current rooms:`, rooms);
+          
+          // Debug check
+          setTimeout(() => {
+            const rooms = Array.from(socket.rooms);
+            console.log(`[DEBUG-SOCKET] User ${authUserId} authenticated. Socket ${socket.id} is in rooms:`, rooms);
+          }, 100);
         }
       } catch (err) {
         console.error('[Socket] Authenticate error:', err.message);
@@ -1908,31 +1912,45 @@ async function startServer() {
     socket.on('start-call', async (data) => {
       try {
         const { to, chatId } = data;
-        console.log(`[DEBUG-CALL] start-call payload received:`, data);
+        const callerId = socket.userId;
         
-        if (!to || !chatId) {
-          console.warn(`[DEBUG-CALL] ERROR: Missing to or chatId:`, data);
+        console.log(`[DEBUG-CALL] start-call: ${callerId} -> ${to} (chat: ${chatId})`);
+        
+        if (!to || !chatId || !callerId) {
+          console.warn(`[DEBUG-CALL] Aborting: Missing to=${to}, chatId=${chatId}, callerId=${callerId}`);
           return;
         }
-        
-        const targetRoom = `user:${to}`;
-        const socketsInRoom = io.sockets.adapter.rooms.get(targetRoom);
-        console.log(`[DEBUG-CALL] Recipient ${to} is in room ${targetRoom}. Active sockets: ${socketsInRoom ? socketsInRoom.size : 0}`);
-        
+
+        const caller = await getCachedUser(db, callerId);
         const callId = `call_${Date.now()}`;
         const roomName = `room_${chatId}_${Date.now()}`;
 
-        activeCalls.set(socket.id, { callId, otherId: to, chatId, roomName, role: 'caller' });
-
         const payload = {
-          from: socket.userId,
-          callerName: socket.username,
+          from: callerId,
+          callerName: caller?.displayName || caller?.username || socket.username || 'Someone',
           chatId,
           callId,
-          roomName
+          roomName,
+          avatar: caller?.avatar
         };
 
-        console.log(`[DEBUG-CALL] Emitting 'incoming-call' to room ${targetRoom}`);
+        const targetRoom = `user:${to}`;
+        const socketsInRoom = io.sockets.adapter.rooms.get(targetRoom);
+        const activeSocketCount = socketsInRoom ? socketsInRoom.size : 0;
+        
+        console.log(`[DEBUG-CALL] Recipient ${to} room: ${targetRoom}, active sockets: ${activeSocketCount}`);
+
+        // Fallback: If room is empty but we have them in onlineUsers, try direct emit
+        if (activeSocketCount === 0) {
+          const entry = onlineUsers.get(to);
+          if (entry && entry.socketIds.size > 0) {
+            console.log(`[DEBUG-CALL] Room empty but onlineUsers has ${entry.socketIds.size} sockets. Emitting directly.`);
+            entry.socketIds.forEach(sid => {
+              safeEmit(io, sid, 'incoming-call', payload);
+            });
+          }
+        }
+
         io.to(targetRoom).emit('incoming-call', payload);
         socket.emit('call-started', payload);
 
