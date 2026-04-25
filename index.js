@@ -1101,10 +1101,18 @@ async function startServer() {
       const result = await db.collection('chats').insertOne(chatDoc);
       chatDoc._id = result.insertedId;
 
+      // Populate participants for the response
+      const usersMap = await batchGetUsers(db, allParticipants);
+      chatDoc.participants = allParticipants.map((pid) => {
+        const u = usersMap.get(String(pid));
+        return u ? { id: u.id, username: u.username, displayName: u.displayName, avatar: u.avatar } : { id: String(pid) };
+      });
+
       const normalized = normalizeChat(chatDoc);
-      // Notify all participants about the new chat so they can join the room
-      allParticipants.forEach((pid) => {
-        safeEmit(io, `user:${pid}`, 'chat:created', buildSocketEvent('chat:created', { chat: normalized }, { chatId: String(result.insertedId) }));
+      
+      const pids = allParticipants.map(p => String(typeof p === 'object' ? (p.id || p._id) : p));
+      pids.forEach((pid) => {
+        safeEmit(io, `user:${pid}`, 'chat:created', buildSocketEvent('chat:created', { chat: normalized }, { chatId: normalized.id }));
       });
 
       successResponse(res, { chat: normalized }, 201);
@@ -1139,17 +1147,26 @@ async function startServer() {
       }
 
       await db.collection('chats').updateOne(
-        { _id: toObjectId(chatId) },
+        { _id: toObjectId(chatIdStr) },
         { 
           $push: { participants: memberId },
           $set: { [`unreadCounts.${memberId}`]: 0, updatedAt: new Date().toISOString() } 
         }
       );
 
-      const updatedChat = await db.collection('chats').findOne({ _id: chatObjId });
+      const updatedChat = await db.collection('chats').findOne({ _id: toObjectId(chatIdStr) });
+      
+      // Populate participants for the response
+      const allPids = updatedChat.participants || [];
+      const usersMap = await batchGetUsers(db, allPids);
+      updatedChat.participants = allPids.map(pid => {
+        const u = usersMap.get(String(pid));
+        return u ? { id: u.id, username: u.username, displayName: u.displayName, avatar: u.avatar } : { id: String(pid) };
+      });
+
       const normalized = normalizeChat(updatedChat);
       
-      updatedChat.participants.forEach((pid) => {
+      allPids.forEach((pid) => {
         safeEmit(io, `user:${pid}`, 'chat:updated', buildSocketEvent('chat:updated', { chat: normalized }, { chatId: chatIdStr }));
       });
 
@@ -1850,17 +1867,22 @@ async function startServer() {
     console.log(`[Socket] Connected: ${username} (${userId}) — ${socket.id}`);
 
     // Re-authenticate / join room explicitly if requested
-    socket.on('authenticate', (authUserId) => {
+    socket.on('authenticate', async (authUserId) => {
       try {
         if (authUserId) {
           socket.userId = String(authUserId);
           socket.join(`user:${authUserId}`);
           
-          // Debug check
-          setTimeout(() => {
-            const rooms = Array.from(socket.rooms);
-            console.log(`[DEBUG-SOCKET] User ${authUserId} authenticated. Socket ${socket.id} is in rooms:`, rooms);
-          }, 100);
+          // Also re-join all chat rooms
+          const userChats = await db.collection('chats').find(
+            { participants: String(authUserId) },
+            { projection: { _id: 1 } }
+          ).toArray();
+          for (const chat of userChats) {
+            socket.join(`chat:${ensureChatIdString(chat._id)}`);
+          }
+          
+          console.log(`[Socket] User ${authUserId} authenticated — joined user room + ${userChats.length} chat rooms`);
         }
       } catch (err) {
         console.error('[Socket] Authenticate error:', err.message);
@@ -1912,64 +1934,68 @@ async function startServer() {
     socket.on('start-call', async (data) => {
       try {
         const { to, chatId } = data;
-        const callerId = socket.userId;
-        
-        console.log(`[DEBUG-CALL] start-call: ${callerId} -> ${to} (chat: ${chatId})`);
-        
-        if (!to || !chatId || !callerId) {
-          console.warn(`[DEBUG-CALL] Aborting: Missing to=${to}, chatId=${chatId}, callerId=${callerId}`);
-          return;
-        }
+        if (!to || !chatId) return;
 
-        const caller = await getCachedUser(db, callerId);
         const callId = `call_${Date.now()}`;
-        const roomName = `room_${chatId}_${Date.now()}`;
+        const roomName = `call_${chatId}_${Date.now()}`;
 
         const payload = {
-          from: callerId,
-          callerName: caller?.displayName || caller?.username || socket.username || 'Someone',
+          from: socket.userId,
+          callerName: socket.username || 'Someone',
           chatId,
           callId,
-          roomName,
-          avatar: caller?.avatar
+          roomName
         };
 
         const targetRoom = `user:${to}`;
-        const socketsInRoom = io.sockets.adapter.rooms.get(targetRoom);
-        const activeSocketCount = socketsInRoom ? socketsInRoom.size : 0;
-        
-        console.log(`[DEBUG-CALL] Recipient ${to} room: ${targetRoom}, active sockets: ${activeSocketCount}`);
+        const roomSockets = io.sockets.adapter.rooms.get(targetRoom);
+        const socketCount = roomSockets ? roomSockets.size : 0;
 
-        // Fallback: If room is empty but we have them in onlineUsers, try direct emit
-        if (activeSocketCount === 0) {
-          const entry = onlineUsers.get(to);
-          if (entry && entry.socketIds.size > 0) {
-            console.log(`[DEBUG-CALL] Room empty but onlineUsers has ${entry.socketIds.size} sockets. Emitting directly.`);
-            entry.socketIds.forEach(sid => {
-              safeEmit(io, sid, 'incoming-call', payload);
-            });
-          }
+        console.log(`[Call] start-call: ${socket.userId} -> ${to} | Room ${targetRoom} has ${socketCount} socket(s)`);
+
+        if (socketCount === 0) {
+          console.warn(`[Call] WARNING: User ${to} has NO sockets in room ${targetRoom}`);
+          socket.emit('call-failed', { reason: 'recipient_offline' });
+          // Still try push notification
+          sendPushNotification(db, to, {
+            title: 'Incoming Voice Call',
+            body: `${socket.username || 'Someone'} is calling you...`,
+            tag: `call_${callId}`,
+            data: { type: 'call', callId, from: socket.userId, chatId, roomName }
+          });
+          return;
         }
 
+        activeCalls.set(socket.id, { callId, otherId: to, chatId, roomName, role: 'caller' });
+
         io.to(targetRoom).emit('incoming-call', payload);
+        console.log(`[Call] Emitted incoming-call to ${to} (${socketCount} socket(s))`);
+
         socket.emit('call-started', payload);
 
-        // Push notification
         sendPushNotification(db, to, {
-          title: `Incoming Voice Call`,
-          body: `${socket.username} is calling you...`,
+          title: 'Incoming Voice Call',
+          body: `${socket.username || 'Someone'} is calling you...`,
           tag: `call_${callId}`,
           data: { type: 'call', callId, from: socket.userId, chatId, roomName }
         });
       } catch (err) {
-        console.error('[Socket] start-call error:', err.message);
+        console.error('[Call] start-call error:', err.message);
       }
     });
 
     socket.on('accept-call', (data) => {
       try {
         const { from, chatId, roomName, callId } = data;
-        activeCalls.set(socket.id, { callId, otherId: from, chatId, roomName, role: 'recipient' });
+        activeCalls.set(socket.id, { callId, otherId: from, chatId, roomName, role: 'recipient', startTime: Date.now() });
+        
+        // Also update caller's startTime
+        for (const [sid, call] of activeCalls.entries()) {
+          if (call.callId === callId && call.role === 'caller') {
+            activeCalls.set(sid, { ...call, startTime: Date.now() });
+          }
+        }
+
         io.to(`user:${from}`).emit('call-accepted', data);
       } catch (err) {
         console.error('[Socket] accept-call error:', err.message);
@@ -1988,13 +2014,26 @@ async function startServer() {
       }
     });
 
-    socket.on('end-call', (data) => {
+    socket.on('end-call', async (data) => {
       try {
         const { otherUserId, callId, chatId } = data;
         for (const [sid, call] of activeCalls.entries()) {
           if (call.callId === callId) activeCalls.delete(sid);
         }
         io.to(`user:${otherUserId}`).emit('call-ended', { callId, chatId });
+
+        // Update call log in DB
+        const callInfo = activeCalls.get(socket.id);
+        const duration = callInfo ? Math.floor((Date.now() - callInfo.startTime) / 1000) : 0;
+        
+        await db.collection('messages').insertOne({
+          chatId: ensureChatIdString(chatId),
+          senderId: 'system',
+          content: `Voice call ended (${duration}s)`,
+          type: 'call_log',
+          metadata: { callId, duration, status: 'completed' },
+          createdAt: new Date().toISOString()
+        });
       } catch (err) {
         console.error('[Socket] end-call error:', err.message);
       }
