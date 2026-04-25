@@ -388,6 +388,7 @@ function normalizeUser(user) {
     displayName: user.displayName || user.username || '',
     avatar: user.avatar || null,
     isOnline: Boolean(user.isOnline),
+    presenceStatus: user.presenceStatus || (user.isOnline ? 'online' : 'offline'),
     lastSeenAt: user.lastSeenAt || null,
     isAdmin: Boolean(user.isAdmin),
     isGuest: Boolean(user.isGuest),
@@ -508,7 +509,7 @@ function invalidateUserCache(userId) {
 function setUserOnline(io, db, userId, socketId) {
   let entry = onlineUsers.get(userId);
   if (!entry) {
-    entry = { socketIds: new Set(), isOnline: false, lastSeenAt: new Date(), debounceTimer: null };
+    entry = { socketIds: new Set(), isOnline: false, presenceStatus: 'offline', lastSeenAt: new Date(), debounceTimer: null };
     onlineUsers.set(userId, entry);
   }
   entry.socketIds.add(socketId);
@@ -516,13 +517,14 @@ function setUserOnline(io, db, userId, socketId) {
   if (!entry.isOnline) {
     entry.debounceTimer = setTimeout(async () => {
       entry.isOnline = true;
+      entry.presenceStatus = 'online';
       entry.lastSeenAt = new Date();
       const oid = toObjectId(userId);
       if (oid) {
-        await db.collection('users').updateOne({ _id: oid }, { $set: { isOnline: true, lastSeenAt: entry.lastSeenAt } }).catch(() => {});
+        await db.collection('users').updateOne({ _id: oid }, { $set: { isOnline: true, presenceStatus: 'online', lastSeenAt: entry.lastSeenAt } }).catch(() => {});
       }
       invalidateUserCache(userId);
-      const event = buildSocketEvent('user:online', { user: { id: userId, isOnline: true, lastSeenAt: entry.lastSeenAt.toISOString() } }, { userId });
+      const event = buildSocketEvent('user:online', { user: { id: userId, isOnline: true, presenceStatus: 'online', lastSeenAt: entry.lastSeenAt.toISOString() } }, { userId });
       safeEmit(io, `user:${userId}:friends`, 'user:online', event);
     }, CONFIG.onlineStatus.debounceMs);
   }
@@ -537,13 +539,14 @@ function setUserOffline(io, db, userId, socketId) {
     entry.debounceTimer = setTimeout(async () => {
       if (entry.socketIds.size > 0) return;
       entry.isOnline = false;
+      entry.presenceStatus = 'offline';
       entry.lastSeenAt = new Date();
       const oid = toObjectId(userId);
       if (oid) {
-        await db.collection('users').updateOne({ _id: oid }, { $set: { isOnline: false, lastSeenAt: entry.lastSeenAt } }).catch(() => {});
+        await db.collection('users').updateOne({ _id: oid }, { $set: { isOnline: false, presenceStatus: 'offline', lastSeenAt: entry.lastSeenAt } }).catch(() => {});
       }
       invalidateUserCache(userId);
-      const event = buildSocketEvent('user:offline', { user: { id: userId, isOnline: false, lastSeenAt: entry.lastSeenAt.toISOString() } }, { userId });
+      const event = buildSocketEvent('user:offline', { user: { id: userId, isOnline: false, presenceStatus: 'offline', lastSeenAt: entry.lastSeenAt.toISOString() } }, { userId });
       safeEmit(io, `user:${userId}:friends`, 'user:offline', event);
       onlineUsers.delete(userId);
     }, CONFIG.onlineStatus.debounceMs);
@@ -763,7 +766,7 @@ async function startServer() {
 
       const usernameLower = username.toLowerCase();
       displayName = sanitizeText(displayName || username, CONFIG.validation.maxUsernameLength);
-      avatar = avatar || `https://api.dicebear.com/7.x/thumbs/svg?seed=${usernameLower}`;
+      avatar = avatar || null;
 
       const existing = await db.collection('users').findOne({ usernameLower });
       if (existing) return errorResponse(res, 409, 'Username already taken', 'USERNAME_TAKEN');
@@ -1003,6 +1006,7 @@ async function startServer() {
         const onlineEntry = onlineUsers.get(n.id);
         if (onlineEntry) {
           n.isOnline = onlineEntry.isOnline;
+          n.presenceStatus = onlineEntry.presenceStatus || (onlineEntry.isOnline ? 'online' : 'offline');
           n.lastSeenAt = onlineEntry.lastSeenAt?.toISOString?.() || n.lastSeenAt;
         }
         return n;
@@ -1024,6 +1028,7 @@ async function startServer() {
       const onlineEntry = onlineUsers.get(userId);
       if (onlineEntry) {
         user.isOnline = onlineEntry.isOnline;
+        user.presenceStatus = onlineEntry.presenceStatus || (onlineEntry.isOnline ? 'online' : 'offline');
         user.lastSeenAt = onlineEntry.lastSeenAt?.toISOString() || user.lastSeenAt;
       }
       successResponse(res, { user });
@@ -1928,6 +1933,26 @@ async function startServer() {
         const chatId = ensureChatIdString(data?.chatId);
         if (chatId) handleTypingStop(socket, io, db, chatId, userId, username);
       } catch {}
+    });
+
+    // --- Presence Update (idle/online) ---
+    socket.on('presence:update', async (data) => {
+      try {
+        const status = data?.status;
+        if (!status || !['online', 'idle'].includes(status)) return;
+        const entry = onlineUsers.get(userId);
+        if (!entry) return;
+        entry.presenceStatus = status;
+        const oid = toObjectId(userId);
+        if (oid) {
+          await db.collection('users').updateOne({ _id: oid }, { $set: { presenceStatus: status } }).catch(() => {});
+        }
+        invalidateUserCache(userId);
+        const event = buildSocketEvent('user:presence', { userId, status }, { userId });
+        safeEmit(io, `user:${userId}:friends`, 'user:presence', event);
+      } catch (err) {
+        console.error('[Socket] presence:update error:', err.message);
+      }
     });
 
     // --- LiveKit Call Signaling ---
