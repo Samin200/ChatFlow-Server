@@ -1943,9 +1943,13 @@ async function startServer() {
         const callId = `call_${Date.now()}`;
         const roomName = isGroup ? `group_call_${chatId}` : `call_${chatId}_${Date.now()}`;
 
+        // Fetch caller to get their real name (displayName)
+        const caller = await db.collection('users').findOne({ _id: isValidObjectId(socket.userId) ? new ObjectId(socket.userId) : socket.userId });
+        const callerName = caller?.displayName || socket.username || 'Someone';
+
         const payload = {
           from: socket.userId,
-          callerName: socket.username || 'Someone',
+          callerName,
           chatId,
           callId,
           roomName,
@@ -1964,7 +1968,7 @@ async function startServer() {
             
             sendPushNotification(db, mid, {
               title: `Incoming ${isVideo ? 'Video' : 'Voice'} Call`,
-              body: `${socket.username || 'Someone'} is calling the group ${chat.name || ''}`,
+              body: `${callerName} is calling the group ${chat.name || ''}`,
               tag: `call_${callId}`,
               data: { type: 'call', callId, from: socket.userId, chatId, roomName, isVideo }
             });
@@ -1987,6 +1991,16 @@ async function startServer() {
             activeCalls.set(socket.id, { callId, otherId: to, chatId, roomName, role: 'caller', isVideo });
             io.to(targetRoom).emit('incoming-call', payload);
             socket.emit('call-started', payload);
+
+            // Insert "Call started" log
+            await db.collection('messages').insertOne({
+              chatId: ensureChatIdString(chatId),
+              senderId: socket.userId,
+              text: `${isVideo ? 'Video' : 'Voice'} call started`,
+              type: 'call_log',
+              metadata: { callId, status: 'started', isVideo },
+              createdAt: new Date().toISOString()
+            });
           }
 
           sendPushNotification(db, to, {
@@ -2030,29 +2044,74 @@ async function startServer() {
         console.error('[Socket] reject-call error:', err.message);
       }
     });
+    
+    socket.on('cancel-call', async (data) => {
+      try {
+        const { to, callId, chatId } = data;
+        const chat = await db.collection('chats').findOne({ _id: isValidObjectId(chatId) ? new ObjectId(chatId) : chatId });
+        if (chat && chat.type === 'group') {
+          const members = chat.participants || [];
+          members.forEach(memberId => {
+            const mid = String(memberId.id || memberId);
+            if (mid !== String(socket.userId)) {
+              io.to(`user:${mid}`).emit('call-canceled', { callId, chatId });
+            }
+          });
+        } else if (to) {
+          io.to(`user:${to}`).emit('call-canceled', { callId, chatId });
+        }
+
+        console.log(`[Call] cancel-call by ${socket.userId} in ${chatId}`);
+
+        // Log cancellation
+        await db.collection('messages').insertOne({
+          chatId: ensureChatIdString(chatId),
+          senderId: socket.userId,
+          text: `Call canceled`,
+          type: 'call_log',
+          metadata: { callId, status: 'canceled' },
+          createdAt: new Date().toISOString()
+        });
+      } catch (err) {
+        console.error('[Socket] cancel-call error:', err.message);
+      }
+    });
 
     socket.on('end-call', async (data) => {
       try {
         const { otherUserId, callId, chatId } = data;
+        let callInfo = null;
         for (const [sid, call] of activeCalls.entries()) {
-          if (call.callId === callId) activeCalls.delete(sid);
+          if (call.callId === callId) {
+            callInfo = { ...call };
+            activeCalls.delete(sid);
+          }
         }
         
-        if (otherUserId) {
+        const chat = await db.collection('chats').findOne({ _id: isValidObjectId(chatId) ? new ObjectId(chatId) : chatId });
+        if (chat && chat.type === 'group') {
+          const members = chat.participants || [];
+          members.forEach(memberId => {
+            const mid = String(memberId.id || memberId);
+            if (mid !== String(socket.userId)) {
+              io.to(`user:${mid}`).emit('call-ended', { callId, chatId });
+            }
+          });
+        } else if (otherUserId) {
           io.to(`user:${otherUserId}`).emit('call-ended', { callId, chatId });
-          console.log(`[Call] end-call: ${socket.userId} -> ${otherUserId}`);
         }
 
+        console.log(`[Call] end-call by ${socket.userId} in ${chatId}`);
+
         // Update call log in DB
-        const callInfo = activeCalls.get(socket.id);
-        const duration = callInfo ? Math.floor((Date.now() - callInfo.startTime) / 1000) : 0;
+        const duration = callInfo?.startTime ? Math.floor((Date.now() - callInfo.startTime) / 1000) : 0;
         
         await db.collection('messages').insertOne({
           chatId: ensureChatIdString(chatId),
-          senderId: 'system',
-          content: `Voice call ended (${duration}s)`,
+          senderId: socket.userId,
+          text: `${callInfo?.isVideo ? 'Video' : 'Voice'} call ended (${duration}s)`,
           type: 'call_log',
-          metadata: { callId, duration, status: 'completed' },
+          metadata: { callId, duration, status: 'completed', isVideo: callInfo?.isVideo },
           createdAt: new Date().toISOString()
         });
       } catch (err) {
